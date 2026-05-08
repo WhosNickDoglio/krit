@@ -34,16 +34,11 @@ builds:
     overrides:
       - goos: linux
         goarch: arm64
-        # ubuntu-24.04 ships gcc-aarch64-linux-gnu (apt-installed by
-        # release.yml). Without an explicit sysroot, cgo's
-        # _cgo_export.c falls through to /usr/include (host glibc),
-        # which fails on bits/libc-header-start.h. The sysroot points
-        # the cross-compiler at the arm64 dev headers instead.
-        env:
-          - CGO_ENABLED=1
-          - CC=aarch64-linux-gnu-gcc
-          - CGO_CFLAGS=--sysroot=/usr/aarch64-linux-gnu
-          - CGO_LDFLAGS=--sysroot=/usr/aarch64-linux-gnu
+        # zig cc handles arm64-linux-glibc cross-compilation cleanly
+        # (sysroot, headers, linker paths all bundled). The release
+        # workflow writes /usr/local/bin/zigcc-glibc-arm64 as a
+        # wrapper around `zig cc -target aarch64-linux-gnu`.
+        env: [CGO_ENABLED=1, CC=zigcc-glibc-arm64]
   - id: krit-lsp-linux
     main: ./cmd/krit-lsp
     binary: krit-lsp
@@ -55,16 +50,11 @@ builds:
     overrides:
       - goos: linux
         goarch: arm64
-        # ubuntu-24.04 ships gcc-aarch64-linux-gnu (apt-installed by
-        # release.yml). Without an explicit sysroot, cgo's
-        # _cgo_export.c falls through to /usr/include (host glibc),
-        # which fails on bits/libc-header-start.h. The sysroot points
-        # the cross-compiler at the arm64 dev headers instead.
-        env:
-          - CGO_ENABLED=1
-          - CC=aarch64-linux-gnu-gcc
-          - CGO_CFLAGS=--sysroot=/usr/aarch64-linux-gnu
-          - CGO_LDFLAGS=--sysroot=/usr/aarch64-linux-gnu
+        # zig cc handles arm64-linux-glibc cross-compilation cleanly
+        # (sysroot, headers, linker paths all bundled). The release
+        # workflow writes /usr/local/bin/zigcc-glibc-arm64 as a
+        # wrapper around `zig cc -target aarch64-linux-gnu`.
+        env: [CGO_ENABLED=1, CC=zigcc-glibc-arm64]
   - id: krit-mcp-linux
     main: ./cmd/krit-mcp
     binary: krit-mcp
@@ -76,16 +66,11 @@ builds:
     overrides:
       - goos: linux
         goarch: arm64
-        # ubuntu-24.04 ships gcc-aarch64-linux-gnu (apt-installed by
-        # release.yml). Without an explicit sysroot, cgo's
-        # _cgo_export.c falls through to /usr/include (host glibc),
-        # which fails on bits/libc-header-start.h. The sysroot points
-        # the cross-compiler at the arm64 dev headers instead.
-        env:
-          - CGO_ENABLED=1
-          - CC=aarch64-linux-gnu-gcc
-          - CGO_CFLAGS=--sysroot=/usr/aarch64-linux-gnu
-          - CGO_LDFLAGS=--sysroot=/usr/aarch64-linux-gnu
+        # zig cc handles arm64-linux-glibc cross-compilation cleanly
+        # (sysroot, headers, linker paths all bundled). The release
+        # workflow writes /usr/local/bin/zigcc-glibc-arm64 as a
+        # wrapper around `zig cc -target aarch64-linux-gnu`.
+        env: [CGO_ENABLED=1, CC=zigcc-glibc-arm64]
 
   # --- Linux / musl ----------------------------------------------------------
   # Disabled for now: ubuntu-24.04's musl-tools wrapper falls back to

@@ -38,18 +38,34 @@ jobs:
       # override points CGO_CFLAGS / CGO_LDFLAGS at the arm64 sysroot
       # so cgo finds the right headers. libc6-dev-arm64-cross is
       # pulled in as a dependency of gcc-aarch64-linux-gnu.
+      # Linux cross-compilation uses zig cc for both arm64 and musl
+      # targets. Ubuntu's gcc-aarch64-linux-gnu + libc6-dev-arm64-cross
+      # combo has flaky sysroot/lib paths (linker can't find
+      # /usr/aarch64-linux-gnu/lib/libc.so.6 because the cross packages
+      # use a multiarch layout the --sysroot flag doesn't follow). zig
+      # bundles glibc + musl + sysroots in one binary and is the
+      # standard escape hatch. We install it once and write per-target
+      # wrapper scripts on PATH so .goreleaser.yml can reference plain
+      # CC values.
       - if: matrix.goos == 'linux'
-        name: Install Linux cross toolchains
+        name: Install zig + cross-cc wrappers
         run: |
-          sudo apt-get update
-          # gcc-aarch64-linux-gnu provides the cross compiler binary;
-          # libc6-dev-arm64-cross provides the arm64 headers (stdlib.h,
-          # bits/libc-header-start.h, etc.) at /usr/aarch64-linux-gnu/.
-          # The package set isn't a hard dependency on every ubuntu
-          # image so install both explicitly.
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu \
-            libc6-dev-arm64-cross
+          set -euo pipefail
+          ZIG_VERSION=0.13.0
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+            | sudo tar -xJ -C /opt
+          sudo ln -sf "/opt/zig-linux-x86_64-${ZIG_VERSION}/zig" /usr/local/bin/zig
+          for target in glibc-arm64:aarch64-linux-gnu; do
+            name="${target%:*}"
+            zig_target="${target##*:}"
+            sudo tee "/usr/local/bin/zigcc-${name}" > /dev/null <<EOF
+          #!/usr/bin/env bash
+          exec zig cc -target ${zig_target} "\$@"
+          EOF
+            sudo chmod +x "/usr/local/bin/zigcc-${name}"
+          done
+          zig version
+          zigcc-glibc-arm64 --version | head -1
 
       # Import the release signing subkey for goreleaser's signs: block.
       - name: Import GPG signing key
