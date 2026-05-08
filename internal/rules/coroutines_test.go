@@ -514,7 +514,11 @@ func TestInjectDispatcher_DoesNotRequireTypeContext(t *testing.T) {
 	}
 }
 
-func TestInjectDispatcher_PositiveMain(t *testing.T) {
+// Dispatchers.Main is intentionally exempted: kotlinx-coroutines-test
+// provides Dispatchers.setMain(testDispatcher) for swapping it in
+// tests, so injection isn't the only path to testability. Mirrors the
+// equivalent exemption in the krit-fir InjectDispatcher checker.
+func TestInjectDispatcher_NegativeMainIsExempt(t *testing.T) {
 	findings := runRuleByName(t, "InjectDispatcher", `
 package test
 import kotlinx.coroutines.Dispatchers
@@ -522,8 +526,8 @@ suspend fun loadData() {
     withContext(Dispatchers.Main) { renderUi() }
 }
 `)
-	if len(findings) == 0 {
-		t.Error("expected InjectDispatcher to flag hardcoded Dispatchers.Main")
+	if len(findings) != 0 {
+		t.Errorf("expected no findings for Dispatchers.Main (test-swappable via setMain), got %d: %v", len(findings), findings)
 	}
 }
 

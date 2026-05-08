@@ -24,9 +24,9 @@ type parsedSettings struct {
 //     bindings substituted.
 //   - Dynamic iteration through forEach { ... } and `for (x in ...)` with
 //     iteration sources:
-//       <dir>.listFiles()                            (flat)
-//       <dir>.walk() / <dir>.walkTopDown()           (recursive)
-//       Files.list(<dir>)                            (flat; any qualifier)
+//     <dir>.listFiles()                            (flat)
+//     <dir>.walk() / <dir>.walkTopDown()           (recursive)
+//     Files.list(<dir>)                            (flat; any qualifier)
 //     Pass-through ops (.filter, .map, .asSequence, .toList, .sortedBy,
 //     .sorted, .filterNot, .mapNotNull) between the iteration source
 //     and the consumer are walked through.
@@ -221,7 +221,12 @@ func (w *ktsWalker) expandTemplate(pieces []stringPiece, ctx *iterCtx) {
 	if ctx.src.recursive {
 		_ = filepath.Walk(ctx.src.dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				return nil // ignore permission errors etc.
+				// Permission errors etc. shouldn't abort the walk; we
+				// just skip subtrees we can't enter and continue.
+				if info != nil && info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil //nolint:nilerr // intentional: skip unreadable files but keep walking
 			}
 			if !info.IsDir() {
 				return nil
@@ -476,7 +481,7 @@ func (w *ktsWalker) substitute(pieces []stringPiece, varName, entry string) (str
 		}
 		// String binding.
 		if inner.Type() == "simple_identifier" {
-			name := string(inner.Content(w.src))
+			name := inner.Content(w.src)
 			if v, ok := w.stringBindings[name]; ok {
 				sb.WriteString(v)
 				continue
@@ -507,7 +512,7 @@ func isLoopVarAccessor(n *sitter.Node, src []byte, varName string) bool {
 		for i := 0; i < int(n.NamedChildCount()); i++ {
 			c := n.NamedChild(i)
 			if c.Type() == "navigation_suffix" && c.NamedChildCount() > 0 {
-				name := string(c.NamedChild(0).Content(src))
+				name := c.NamedChild(0).Content(src)
 				if name == "name" || name == "fileName" {
 					return true
 				}
@@ -526,7 +531,7 @@ func identMatches(n *sitter.Node, src []byte, name string) bool {
 	if int(n.EndByte()-n.StartByte()) != len(name) {
 		return false
 	}
-	return string(n.Content(src)) == name
+	return n.Content(src) == name
 }
 
 // stringPiece is one chunk of a string_literal: a literal text run or
@@ -543,7 +548,7 @@ func stringPieces(strNode *sitter.Node, src []byte) []stringPiece {
 		c := strNode.NamedChild(i)
 		switch c.Type() {
 		case "string_content":
-			pieces = append(pieces, stringPiece{literal: string(c.Content(src))})
+			pieces = append(pieces, stringPiece{literal: c.Content(src)})
 		case "interpolated_expression", "interpolation":
 			pieces = append(pieces, stringPiece{interpolation: c})
 		}
@@ -574,7 +579,7 @@ func (w *ktsWalker) text(n *sitter.Node) string {
 	if n == nil {
 		return ""
 	}
-	return string(n.Content(w.src))
+	return n.Content(w.src)
 }
 
 // calleeName returns the rightmost identifier name of a call_expression's
@@ -586,7 +591,7 @@ func calleeName(callExpr *sitter.Node, src []byte) string {
 	expr := callExpr.NamedChild(0)
 	switch expr.Type() {
 	case "simple_identifier":
-		return string(expr.Content(src))
+		return expr.Content(src)
 	case "navigation_expression":
 		return navSuffixIdent(expr, src)
 	}
@@ -611,7 +616,7 @@ func calleeQualifierEndsWith(callExpr *sitter.Node, name string, src []byte) boo
 	left := expr.NamedChild(0)
 	switch left.Type() {
 	case "simple_identifier":
-		return string(left.Content(src)) == name
+		return left.Content(src) == name
 	case "navigation_expression":
 		return navSuffixIdent(left, src) == name
 	}
@@ -623,7 +628,7 @@ func navSuffixIdent(navExpr *sitter.Node, src []byte) string {
 	for i := int(navExpr.NamedChildCount()) - 1; i >= 0; i-- {
 		c := navExpr.NamedChild(i)
 		if c.Type() == "navigation_suffix" && c.NamedChildCount() > 0 {
-			return string(c.NamedChild(0).Content(src))
+			return c.NamedChild(0).Content(src)
 		}
 	}
 	return ""
@@ -742,7 +747,7 @@ func lambdaParamName(lambda *sitter.Node, src []byte) string {
 			if vd.Type() == "variable_declaration" && vd.NamedChildCount() > 0 {
 				id := vd.NamedChild(0)
 				if id.Type() == "simple_identifier" {
-					return string(id.Content(src))
+					return id.Content(src)
 				}
 			}
 		}

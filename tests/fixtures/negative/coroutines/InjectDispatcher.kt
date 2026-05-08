@@ -62,11 +62,15 @@ class MyClass {
     }
 }
 
+// A type with the same property name as kotlinx.coroutines.Dispatchers
+// but a different fully-qualified name. The rule should rely on the
+// receiver type (kotlinx.coroutines.Dispatchers) rather than just the
+// property name, so this must NOT trigger the rule.
 object LocalDispatchers {
-    val IO: String = "io"
+    val IO: CoroutineDispatcher = TODO()
 }
 
-fun localDispatcherLookalike() {
+suspend fun localDispatcherLookalike() {
     withContext(LocalDispatchers.IO) { fetchFromNetwork() }
 }
 

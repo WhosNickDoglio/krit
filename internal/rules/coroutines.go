@@ -134,6 +134,72 @@ func findDirectDispatcherArgumentFlat(file *scanner.File, args uint32, names map
 	return 0, ""
 }
 
+// injectDispatcherIdiomaticHost reports whether a call_expression's
+// callee is one of the API hosts where a hardcoded dispatcher argument
+// is conventional and dispatcher injection wouldn't help. Mirrors the
+// `isIdiomaticDispatcherHost` filter in the krit-fir InjectDispatcher
+// checker so the two implementations stay in parity.
+//
+// Recognized:
+//
+//   - `flowOn(...)`, `shareIn(...)`, `CoroutineScope(...)` — always.
+//   - `viewModelScope.launch(...)` / `viewModelScope.async(...)`.
+//   - `lifecycleScope.launch(...)` / `lifecycleScope.launchWhen{Created,Started,Resumed}(...)`.
+func injectDispatcherIdiomaticHost(file *scanner.File, callIdx uint32) bool {
+	callee := injectDispatcherCalleeName(file, callIdx)
+	switch callee {
+	case "flowOn", "shareIn", "CoroutineScope":
+		return true
+	case "async":
+		return injectDispatcherReceiverName(file, callIdx) == "viewModelScope"
+	case "launch":
+		recv := injectDispatcherReceiverName(file, callIdx)
+		return recv == "viewModelScope" || recv == "lifecycleScope"
+	case "launchWhenCreated", "launchWhenStarted", "launchWhenResumed":
+		return injectDispatcherReceiverName(file, callIdx) == "lifecycleScope"
+	}
+	return false
+}
+
+// injectDispatcherCalleeName returns the simple method name of a
+// call_expression. For `launch(...)` returns "launch"; for
+// `vm.launch(...)` returns "launch". Empty for shapes we don't model.
+func injectDispatcherCalleeName(file *scanner.File, callIdx uint32) string {
+	callee := file.FlatNamedChild(callIdx, 0)
+	if callee == 0 {
+		return ""
+	}
+	switch file.FlatType(callee) {
+	case "simple_identifier":
+		return file.FlatNodeText(callee)
+	case "navigation_expression":
+		return flatNavigationExpressionLastIdentifier(file, callee)
+	}
+	return ""
+}
+
+// injectDispatcherReceiverName returns the immediate receiver
+// identifier of a member call. For `vm.launch(...)` returns "vm".
+// For chained navigation `a.b.launch(...)` returns "b". Empty when
+// there's no explicit receiver.
+func injectDispatcherReceiverName(file *scanner.File, callIdx uint32) string {
+	callee := file.FlatNamedChild(callIdx, 0)
+	if callee == 0 || file.FlatType(callee) != "navigation_expression" {
+		return ""
+	}
+	first := file.FlatNamedChild(callee, 0)
+	if first == 0 {
+		return ""
+	}
+	switch file.FlatType(first) {
+	case "simple_identifier":
+		return file.FlatNodeText(first)
+	case "navigation_expression":
+		return flatNavigationExpressionLastIdentifier(file, first)
+	}
+	return ""
+}
+
 func injectDispatcherReferenceConfirmed(file *scanner.File, idx uint32) bool {
 	if file == nil || idx == 0 {
 		return false

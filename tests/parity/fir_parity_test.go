@@ -191,7 +191,13 @@ func writeParityStubs(t *testing.T, dir string) []string {
 		"Coroutines.kt": `package kotlinx.coroutines
 
 open class CoroutineDispatcher
-class CoroutineScope
+
+// Mirrors the real kotlinx.coroutines API where CoroutineScope is both
+// an interface and a factory function. The default-arg ctor here lets
+// fixture code call CoroutineScope() (with no args, e.g. in the
+// lifecycleScope getter) and CoroutineScope(Dispatchers.IO) (for
+// hardcoded-dispatcher tests) without separate stub overloads.
+class CoroutineScope(context: CoroutineDispatcher? = null)
 
 object Dispatchers {
     val IO: CoroutineDispatcher = CoroutineDispatcher()
@@ -200,18 +206,38 @@ object Dispatchers {
     val Main: CoroutineDispatcher = CoroutineDispatcher()
 }
 
-suspend fun <T> withContext(context: CoroutineDispatcher, block: () -> T): T = block()
-fun CoroutineScope.launch(block: () -> Unit) { block() }
-fun CoroutineScope.launch(context: CoroutineDispatcher, block: () -> Unit) { block() }
+// Real kotlinx.coroutines uses suspend blocks for launch/async/
+// withContext; mirroring that here so fixture code can call
+// withContext(...) inside those builders without compile errors.
+suspend fun <T> withContext(context: CoroutineDispatcher, block: suspend () -> T): T = block()
+fun CoroutineScope.launch(block: suspend CoroutineScope.() -> Unit) {}
+fun CoroutineScope.launch(context: CoroutineDispatcher, block: suspend CoroutineScope.() -> Unit) {}
+fun <T> CoroutineScope.async(context: CoroutineDispatcher, block: suspend CoroutineScope.() -> T) {}
 `,
 		"Flow.kt": `package kotlinx.coroutines.flow
 
-interface Flow<T> {
-    fun collect(action: (T) -> Unit) {}
-}
-class MutableStateFlow<T>(initial: T) : Flow<T>
+import kotlinx.coroutines.CoroutineDispatcher
 
-fun <T> Flow<T>.collect(action: (T) -> Unit) {}
+interface FlowCollector<T> {
+    suspend fun emit(value: T)
+}
+
+interface Flow<T> {
+    // Real kotlinx.coroutines.flow has Flow.collect(FlowCollector) as
+    // the abstract member and a top-level extension that takes a
+    // lambda. The lambda extension isn't auto-imported, which makes
+    // unqualified flow.collect lambda calls fail to resolve in fixture
+    // code unless explicitly imported. Folding the lambda overload
+    // into the member here keeps fixtures simple.
+    suspend fun collect(action: suspend (T) -> Unit)
+}
+
+class MutableStateFlow<T>(initial: T) : Flow<T> {
+    override suspend fun collect(action: suspend (T) -> Unit) {}
+}
+
+fun <T> flow(block: suspend FlowCollector<T>.() -> Unit): Flow<T> = TODO()
+fun <T> Flow<T>.flowOn(context: CoroutineDispatcher): Flow<T> = this
 `,
 		"Compose.kt": `package androidx.compose.runtime
 
@@ -246,8 +272,11 @@ class Lifecycle {
 val AppCompatActivity.lifecycleScope: CoroutineScope
     get() = CoroutineScope()
 
-fun repeatOnLifecycle(state: Lifecycle.State, block: () -> Unit) { block() }
-fun Lifecycle.repeatOnLifecycle(state: Lifecycle.State, block: () -> Unit) { block() }
+// Real androidx.lifecycle.repeatOnLifecycle takes a suspend block;
+// fixture code calls flow.collect inside it, which requires the
+// surrounding lambda to be suspend.
+suspend fun repeatOnLifecycle(state: Lifecycle.State, block: suspend () -> Unit) { block() }
+suspend fun Lifecycle.repeatOnLifecycle(state: Lifecycle.State, block: suspend () -> Unit) { block() }
 `,
 	}
 

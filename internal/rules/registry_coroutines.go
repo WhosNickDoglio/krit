@@ -166,6 +166,20 @@ func registerCoroutinesInjectDispatcher() {
 			if !injectDispatcherReferenceConfirmed(file, dispatcherNode) {
 				return
 			}
+			// Idiomatic-host filter mirroring the FIR checker. Some
+			// call sites accept a dispatcher *as part of their API
+			// contract* (e.g. `flowOn`, `shareIn`, `CoroutineScope(...)`,
+			// `viewModelScope.launch`, `lifecycleScope.launchWhen*`),
+			// where injecting a dispatcher param doesn't help — the
+			// call already takes a dispatcher and the surrounding scope
+			// is fixed. Don't flag those. `Main` is similarly exempted
+			// because there's no "test main dispatcher" alternative.
+			if injectDispatcherIdiomaticHost(file, idx) {
+				return
+			}
+			if dispatcherName == "Main" {
+				return
+			}
 			matchLine := file.FlatRow(dispatcherNode) + 1
 			matchCol := file.FlatCol(dispatcherNode) + 1
 			ctx.EmitAt(matchLine, matchCol,

@@ -14,7 +14,7 @@ suspend fun directWithContext() {
     }
 }
 
-suspend fun directLaunch() {
+suspend fun CoroutineScope.directLaunch() {
     launch(Dispatchers.Default) {
         fetchFromNetwork()
     }
@@ -45,10 +45,6 @@ class MyViewModel : ViewModel() {
 class MyFragment : Fragment() {
     fun loadFromLifecycleScope() {
         lifecycleScope.launch(Dispatchers.IO) { fetchFromNetwork() }
-    }
-
-    fun launchWhenStarted() {
-        lifecycleScope.launchWhenStarted { withContext(Dispatchers.IO) { fetchFromNetwork() } }
     }
 }
 
