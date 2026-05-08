@@ -40,7 +40,16 @@ jobs:
       # pulled in as a dependency of gcc-aarch64-linux-gnu.
       - if: matrix.goos == 'linux'
         name: Install Linux cross toolchains
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+        run: |
+          sudo apt-get update
+          # gcc-aarch64-linux-gnu provides the cross compiler binary;
+          # libc6-dev-arm64-cross provides the arm64 headers (stdlib.h,
+          # bits/libc-header-start.h, etc.) at /usr/aarch64-linux-gnu/.
+          # The package set isn't a hard dependency on every ubuntu
+          # image so install both explicitly.
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
 
       # Import the release signing subkey for goreleaser's signs: block.
       - name: Import GPG signing key
