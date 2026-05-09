@@ -133,10 +133,7 @@ func javaPackageName(file *File) string {
 		if pkg != "" || file.FlatType(idx) != "package_declaration" {
 			return
 		}
-		text := strings.TrimSpace(file.FlatNodeText(idx))
-		text = strings.TrimPrefix(text, "package")
-		text = strings.TrimSuffix(text, ";")
-		pkg = strings.TrimSpace(text)
+		pkg = parsePackageHeaderText(file.FlatNodeText(idx))
 	})
 	return internString(pkg)
 }
@@ -218,16 +215,22 @@ func collectJavaReferencesFlatUncached(file *File, refs *[]Reference) {
 			continue
 		}
 		*refs = append(*refs, Reference{
-			Name: name,
-			File: file.Path,
-			Line: int(node.StartRow) + 1,
+			Name:      name,
+			File:      file.Path,
+			Line:      int(node.StartRow) + 1,
+			StartByte: int(node.StartByte),
+			EndByte:   int(node.EndByte),
+			Language:  LangJava,
 		})
 		if isSimple {
 			if prop := javaAccessorPropertyName(name); prop != "" {
 				*refs = append(*refs, Reference{
-					Name: prop,
-					File: file.Path,
-					Line: int(node.StartRow) + 1,
+					Name:      prop,
+					File:      file.Path,
+					Line:      int(node.StartRow) + 1,
+					StartByte: int(node.StartByte),
+					EndByte:   int(node.EndByte),
+					Language:  LangJava,
 				})
 			}
 		}
