@@ -32,6 +32,7 @@ import (
 
 	"github.com/kaeawc/krit/internal/cacheutil"
 	"github.com/kaeawc/krit/internal/hashutil"
+	"github.com/kaeawc/krit/internal/iterutil"
 	"github.com/kaeawc/krit/internal/perf"
 	"github.com/kaeawc/krit/internal/projectroot"
 	"github.com/kaeawc/krit/internal/store"
@@ -511,6 +512,21 @@ func AssembleOracle(hits []*CacheEntry, fresh *Data) *Data {
 	return out
 }
 
+// mergeData combines per-shard `*Data` results into a single result.
+//
+// Disjointness invariant: callers (currently `splitMissesForKAA`)
+// produce shards whose Files keys do not overlap. If a future shard
+// strategy violates that, the merge would silently last-write-wins on
+// collisions in goroutine-completion order — non-deterministic.
+//
+// We enforce the invariant explicitly: a duplicate key panics with a
+// clear message. Today this is unreachable; tomorrow it surfaces the
+// bug at the producer rather than letting silent non-determinism
+// propagate into oracle facts and downstream type inference. See #33.
+//
+// Dependencies use last-write-wins because that's the documented
+// merge semantic for jar-resolved class facts (see mergeCachedClasses
+// callers): they are intentionally idempotent across shards.
 func mergeData(parts ...*Data) *Data {
 	out := &Data{
 		Version:      1,
@@ -525,6 +541,9 @@ func mergeData(parts ...*Data) *Data {
 			out.KotlinVersion = part.KotlinVersion
 		}
 		for path, file := range part.Files {
+			if _, dup := out.Files[path]; dup {
+				panic(fmt.Sprintf("oracle: mergeData received non-disjoint Files key %q across shards (#33 disjointness invariant)", path))
+			}
 			out.Files[path] = file
 		}
 		for fqn, cls := range part.Dependencies {
@@ -551,6 +570,11 @@ type CacheDepsEntry struct {
 	PerFileDeps map[string]*Class `json:"perFileDeps"`
 }
 
+// mergeCacheDeps is the CacheDepsFile counterpart of mergeData. The
+// same disjointness invariant applies: callers split files across
+// shards by path so per-shard `Files` and `Crashed` maps are unique.
+// A future overlapping shard strategy would otherwise silently
+// last-write-wins on goroutine completion order — see #33.
 func mergeCacheDeps(parts ...*CacheDepsFile) *CacheDepsFile {
 	var sawPart bool
 	out := &CacheDepsFile{
@@ -567,9 +591,15 @@ func mergeCacheDeps(parts ...*CacheDepsFile) *CacheDepsFile {
 			out.Approximation = part.Approximation
 		}
 		for path, entry := range part.Files {
+			if _, dup := out.Files[path]; dup {
+				panic(fmt.Sprintf("oracle: mergeCacheDeps received non-disjoint Files key %q across shards (#33 disjointness invariant)", path))
+			}
 			out.Files[path] = entry
 		}
 		for path, msg := range part.Crashed {
+			if _, dup := out.Crashed[path]; dup {
+				panic(fmt.Sprintf("oracle: mergeCacheDeps received non-disjoint Crashed key %q across shards (#33 disjointness invariant)", path))
+			}
 			out.Crashed[path] = msg
 		}
 	}
@@ -687,7 +717,13 @@ func freshOracleEntryJobs(fresh *Data, deps *CacheDepsFile) []freshOracleEntryJo
 	if deps != nil {
 		approx = deps.Approximation
 	}
-	for path, fr := range fresh.Files {
+	// Iterate paths in sorted order so the resulting `jobs` slice is
+	// stable across runs. Downstream batching in cache_writer slices
+	// `jobs[start:end]` into per-pack-handle batches, so non-deterministic
+	// ordering here propagates into pack file content distribution and
+	// (combined with #25) into pack file byte layout — see #34.
+	for _, path := range iterutil.SortedKeys(fresh.Files) {
+		fr := fresh.Files[path]
 		var depEntry *CacheDepsEntry
 		if deps != nil {
 			depEntry = deps.Files[path]
@@ -707,12 +743,12 @@ func freshOracleEntryJobs(fresh *Data, deps *CacheDepsFile) []freshOracleEntryJo
 		})
 	}
 	if deps != nil {
-		for path, errMsg := range deps.Crashed {
+		for _, path := range iterutil.SortedKeys(deps.Crashed) {
 			jobs = append(jobs, freshOracleEntryJob{
 				path:          path,
 				approximation: approx,
 				crashed:       true,
-				crashError:    errMsg,
+				crashError:    deps.Crashed[path],
 			})
 		}
 	}
