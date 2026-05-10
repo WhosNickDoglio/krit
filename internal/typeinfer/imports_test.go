@@ -118,7 +118,7 @@ class Foo
 `
 	file := parseTestFile(t, src)
 
-	got := extractPackageFlat(0, file)
+	got := extractPackageFlat(file)
 	if got != "com.example.app" {
 		t.Errorf("expected 'com.example.app', got %q", got)
 	}
@@ -129,9 +129,47 @@ func TestExtractPackage_NoPackage(t *testing.T) {
 `
 	file := parseTestFile(t, src)
 
-	got := extractPackageFlat(0, file)
+	got := extractPackageFlat(file)
 	if got != "" {
 		t.Errorf("expected empty string for no package, got %q", got)
+	}
+}
+
+// Regression for #44 / #114: tree-sitter Kotlin sometimes attaches a
+// trailing block comment to the package_header node. The pre-migration
+// code did `TrimPrefix(text, "package ")` and stopped — leaving the
+// trivia attached to the returned package name.
+func TestExtractPackage_StripsTrailingBlockCommentTrivia(t *testing.T) {
+	src := `package com.example.app
+/* TODO: split this module */
+
+class Foo
+`
+	file := parseTestFile(t, src)
+
+	got := extractPackageFlat(file)
+	if got != "com.example.app" {
+		t.Errorf("expected 'com.example.app' (trivia stripped), got %q", got)
+	}
+}
+
+// Regression for the same bug surfaced via buildImportTableFlat.
+func TestImportTable_StripsTrailingBlockCommentTrivia(t *testing.T) {
+	src := `package test
+
+import com.example.Foo
+/* trailing trivia attached to last import */
+
+class Bar { fun f() = Foo() }
+`
+	file := parseTestFile(t, src)
+	it := buildImportTableFlat(file)
+	got, ok := it.Explicit["Foo"]
+	if !ok {
+		t.Fatalf("Foo missing from Explicit imports: %+v", it.Explicit)
+	}
+	if got != "com.example.Foo" {
+		t.Errorf("Explicit[Foo] = %q, want com.example.Foo (trivia stripped)", got)
 	}
 }
 
@@ -170,7 +208,7 @@ class Foo
 `
 	file := parseTestFile(t, src)
 
-	got := extractPackageFlat(0, file)
+	got := extractPackageFlat(file)
 	if got != "org.example" {
 		t.Errorf("expected 'org.example', got %q", got)
 	}
