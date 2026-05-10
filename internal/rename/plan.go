@@ -18,6 +18,10 @@ func ValidatePlan(plan Plan) error {
 	if plan.Target.FromFQN == plan.Target.ToFQN {
 		return fmt.Errorf("rename: from and to are identical")
 	}
+	if len(plan.Conflicts) > 0 {
+		c := plan.Conflicts[0]
+		return fmt.Errorf("rename: destination %s already declared at %s:%d; refusing to proceed", plan.Target.ToFQN, c.File, c.Line)
+	}
 	return nil
 }
 
@@ -69,6 +73,10 @@ type Plan struct {
 	Declarations []scanner.Symbol
 	References   []scanner.Reference
 	Files        []string
+	// Conflicts are declarations already present at Target.ToFQN — a
+	// rename into an occupied FQN would land two declarations at the
+	// same name. ValidatePlan refuses to proceed when this is non-empty.
+	Conflicts []scanner.Symbol
 
 	contexts    map[string]fileContext
 	filesByPath map[string]*scanner.File
@@ -131,31 +139,15 @@ func BuildPlanWithFiles(idx *scanner.CodeIndex, target Target, extraFiles []*sca
 	}
 
 	files := make(map[string]bool)
+	plan.collectSymbols(idx, target, files)
+	plan.collectReferences(idx, target, files)
 
-	for _, sym := range idx.Symbols {
-		if sym.Name != target.FromName {
-			continue
+	sort.Slice(plan.Conflicts, func(i, j int) bool {
+		if plan.Conflicts[i].File != plan.Conflicts[j].File {
+			return plan.Conflicts[i].File < plan.Conflicts[j].File
 		}
-		if sym.FQN != "" && sym.FQN != target.FromFQN {
-			continue
-		}
-		plan.Declarations = append(plan.Declarations, sym)
-		files[sym.File] = true
-	}
-
-	if idx.MayHaveReference(target.FromName) {
-		for _, ref := range idx.References {
-			if ref.Name != target.FromName || ref.InComment {
-				continue
-			}
-			if !plan.referenceMatchesTarget(ref) {
-				continue
-			}
-			plan.References = append(plan.References, ref)
-			files[ref.File] = true
-		}
-	}
-
+		return plan.Conflicts[i].Line < plan.Conflicts[j].Line
+	})
 	sort.Slice(plan.Declarations, func(i, j int) bool {
 		if plan.Declarations[i].File != plan.Declarations[j].File {
 			return plan.Declarations[i].File < plan.Declarations[j].File
@@ -196,6 +188,38 @@ func (p Plan) Summary() Summary {
 func (p Plan) CandidateCount() int {
 	summary := p.Summary()
 	return summary.Declarations + summary.References
+}
+
+func (p *Plan) collectSymbols(idx *scanner.CodeIndex, target Target, files map[string]bool) {
+	for _, sym := range idx.Symbols {
+		if sym.Name == target.ToName && sym.FQN == target.ToFQN {
+			p.Conflicts = append(p.Conflicts, sym)
+		}
+		if sym.Name != target.FromName {
+			continue
+		}
+		if sym.FQN != "" && sym.FQN != target.FromFQN {
+			continue
+		}
+		p.Declarations = append(p.Declarations, sym)
+		files[sym.File] = true
+	}
+}
+
+func (p *Plan) collectReferences(idx *scanner.CodeIndex, target Target, files map[string]bool) {
+	if !idx.MayHaveReference(target.FromName) {
+		return
+	}
+	for _, ref := range idx.References {
+		if ref.Name != target.FromName || ref.InComment {
+			continue
+		}
+		if !p.referenceMatchesTarget(ref) {
+			continue
+		}
+		p.References = append(p.References, ref)
+		files[ref.File] = true
+	}
 }
 
 // indexFile records the parsed file and its derived context. Idempotent
