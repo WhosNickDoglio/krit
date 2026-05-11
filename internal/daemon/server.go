@@ -20,7 +20,23 @@ import (
 // Handler runs a single verb. It receives the raw JSON args and returns a
 // JSON-marshalable result or an error. Handlers may be invoked concurrently;
 // the verb implementation is responsible for any internal locking.
+//
+// A handler may return a value that implements RawResponseWriter to skip
+// the default json.Marshal envelope and stream the response directly into
+// the connection. This is the streaming path issue #60 added so the
+// analyze-project verb avoids buffering the multi-megabyte findings JSON
+// in memory.
 type Handler func(ctx context.Context, args json.RawMessage) (any, error)
+
+// RawResponseWriter is the optional interface a Handler result can
+// implement to bypass the json.Marshal + Response envelope path. The
+// dispatch loop hands the request context plus connection writer; the
+// implementation must write a complete newline-terminated Response
+// envelope. WriteResponseLine is the canonical helper for the
+// fallback/error case.
+type RawResponseWriter interface {
+	WriteRawResponse(ctx context.Context, w io.Writer) error
+}
 
 // Server is a long-lived process that accepts daemon Requests on a Unix
 // socket and dispatches each to a registered Handler.
@@ -196,22 +212,34 @@ func (s *Server) acceptLoop(ctx context.Context) {
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
+	// Wrap the write side too so dispatch handlers that issue many
+	// small Write calls (the streaming analyze-project path emits
+	// envelope head/body/tail in 3+ chunks) coalesce into one
+	// syscall per response.
+	writer := bufio.NewWriter(conn)
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) == 0 {
 			if err == nil || errors.Is(err, io.EOF) {
 				return
 			}
-			writeResponse(conn, errorResponse(err.Error()))
+			writeResponse(writer, errorResponse(err.Error()))
+			_ = writer.Flush()
 			return
 		}
 		var req Request
 		if err := json.Unmarshal(line, &req); err != nil {
-			writeResponse(conn, errorResponse("invalid request: "+err.Error()))
+			writeResponse(writer, errorResponse("invalid request: "+err.Error()))
+			if flushErr := writer.Flush(); flushErr != nil {
+				return
+			}
 			continue
 		}
-		resp := s.dispatch(ctx, req)
-		if !writeResponse(conn, resp) {
+		ok := s.dispatchAndWrite(ctx, req, writer)
+		if flushErr := writer.Flush(); flushErr != nil {
+			return
+		}
+		if !ok {
 			return
 		}
 		if req.Verb == VerbShutdown {
@@ -230,26 +258,48 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) dispatch(ctx context.Context, req Request) Response {
+// dispatchAndWrite resolves the verb and writes the response directly
+// into w. Returns false when the connection should be closed (write
+// error). When the handler result implements RawResponseWriter the
+// streaming path is taken; otherwise the standard json.Marshal +
+// Response envelope is written via writeResponse.
+func (s *Server) dispatchAndWrite(ctx context.Context, req Request, w io.Writer) bool {
 	s.lastActivity.Store(time.Now().UnixNano())
 	s.mu.RLock()
 	h, ok := s.handlers[req.Verb]
 	s.mu.RUnlock()
 	if !ok {
-		return errorResponse(fmt.Sprintf("unknown verb %q", req.Verb))
+		return writeResponse(w, errorResponse(fmt.Sprintf("unknown verb %q", req.Verb)))
 	}
 	result, err := h(ctx, req.Args)
 	if err != nil {
-		return errorResponse(err.Error())
+		return writeResponse(w, errorResponse(err.Error()))
+	}
+	if rw, ok := result.(RawResponseWriter); ok {
+		return rw.WriteRawResponse(ctx, w) == nil
 	}
 	data, err := json.Marshal(result)
 	if err != nil {
-		return errorResponse("marshal result: " + err.Error())
+		return writeResponse(w, errorResponse("marshal result: "+err.Error()))
 	}
-	return Response{OK: true, Data: data}
+	return writeResponse(w, Response{OK: true, Data: data})
 }
 
 func errorResponse(msg string) Response { return Response{OK: false, Error: msg} }
+
+// WriteErrorResponseLine emits a `{"ok":false,"error":...}\n` line
+// using the daemon's wire format. Exported so RawResponseWriter
+// implementations can fall back to the standard error envelope
+// without re-implementing the line-delimited shape.
+func WriteErrorResponseLine(w io.Writer, msg string) error {
+	buf, err := json.Marshal(errorResponse(msg))
+	if err != nil {
+		return err
+	}
+	buf = append(buf, '\n')
+	_, err = w.Write(buf)
+	return err
+}
 
 func writeResponse(w io.Writer, resp Response) bool {
 	buf, err := json.Marshal(resp)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -34,7 +35,7 @@ var errDaemonNotWarm = errors.New("daemon not warm yet")
 // and the dispatcher — a verified DATA RACE under -race. Loosening
 // the lock requires making the rules config state per-call or
 // initialising it once at daemon startup. See issue #53.
-func handleAnalyzeProject(ctx context.Context, state *daemonState, raw json.RawMessage) (any, error) {
+func handleAnalyzeProject(_ context.Context, state *daemonState, raw json.RawMessage) (any, error) {
 	var args daemon.AnalyzeProjectArgs
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -62,30 +63,125 @@ func handleAnalyzeProject(ctx context.Context, state *daemonState, raw json.RawM
 		return nil, err
 	}
 
-	out, err := pipeline.RunProject(ctx, in)
-	state.analyzeMu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	state.coldDone.Store(true)
-	xfile := state.workspace.CrossFileStats()
-
-	return daemon.AnalyzeProjectResult{
-		Findings: out.JSON,
-		Stats: daemon.AnalyzeProjectStats{
-			FilesScanned:    out.FilesScanned,
-			FindingsCount:   out.FindingsCount,
-			WallSeconds:     time.Since(start).Seconds(),
-			CodeIndexHit:    xfile.HasCodeIndex,
-			LibraryFactsHit: xfile.HasLibraryFacts,
-			ResolverHit:     xfile.HasResolver,
-			OracleFilterHit: xfile.HasOracleFilter,
-			DirtyFiles:      len(dirty),
-			Cold:            cold,
-			ParseHits:       out.ParseHits,
-			ParseMisses:     out.ParseMisses,
-		},
+	// Defer pipeline execution into WriteRawResponse so the
+	// OutputPhase JSON streams directly into the connection instead
+	// of being buffered in memory (#60). The lock is held for the
+	// duration of the run.
+	return &streamingAnalyzeResponse{
+		state:       state,
+		in:          in,
+		start:       start,
+		cold:        cold,
+		dirtyN:      len(dirty),
+		releaseLock: state.analyzeMu.Unlock,
 	}, nil
+}
+
+type streamingAnalyzeResponse struct {
+	state       *daemonState
+	in          pipeline.ProjectInput
+	start       time.Time
+	cold        bool
+	dirtyN      int
+	releaseLock func()
+}
+
+var _ daemon.RawResponseWriter = (*streamingAnalyzeResponse)(nil)
+
+func (r *streamingAnalyzeResponse) WriteRawResponse(ctx context.Context, w io.Writer) error {
+	defer r.releaseLock()
+
+	hw := &analyzeRespWriter{out: w, head: []byte(`{"ok":true,"data":{"findings":`)}
+	res, err := pipeline.RunProjectStreaming(ctx, r.in, hw)
+	if err != nil {
+		if !hw.headWritten {
+			return daemon.WriteErrorResponseLine(w, err.Error())
+		}
+		// Head already flushed; the connection is borked and the
+		// caller will close it after seeing the error.
+		return err
+	}
+	r.state.coldDone.Store(true)
+	xfile := r.state.workspace.CrossFileStats()
+
+	statsBytes, err := json.Marshal(daemon.AnalyzeProjectStats{
+		FilesScanned:    res.FilesScanned,
+		FindingsCount:   res.FindingsCount,
+		WallSeconds:     time.Since(r.start).Seconds(),
+		CodeIndexHit:    xfile.HasCodeIndex,
+		LibraryFactsHit: xfile.HasLibraryFacts,
+		ResolverHit:     xfile.HasResolver,
+		OracleFilterHit: xfile.HasOracleFilter,
+		DirtyFiles:      r.dirtyN,
+		Cold:            r.cold,
+		ParseHits:       res.ParseHits,
+		ParseMisses:     res.ParseMisses,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal stats: %w", err)
+	}
+	if _, err := w.Write([]byte(`,"stats":`)); err != nil {
+		return err
+	}
+	if _, err := w.Write(statsBytes); err != nil {
+		return err
+	}
+	_, err = w.Write(envelopeTail)
+	return err
+}
+
+// envelopeTail closes the streaming response: end-of-stats, end-of-data,
+// end-of-envelope, line-delimited newline.
+var envelopeTail = []byte("}}\n")
+
+// newlineSlice is referenced from analyzeRespWriter when reissuing a
+// held trailing newline so each held-flush doesn't allocate a 1-byte
+// slice.
+var newlineSlice = []byte{'\n'}
+
+// analyzeRespWriter wraps the underlying writer with two transforms:
+// it lazily emits an envelope head on the first non-empty Write (so a
+// pre-output pipeline error can still produce a clean error envelope),
+// and it strips the trailing '\n' that json.Encoder appends to its
+// value (the daemon wire is line-delimited; an internal '\n' would let
+// the client's bufio.Reader.ReadBytes('\n') return a truncated body).
+// Held newlines are reissued before the next chunk so internal '\n'
+// bytes survive — only the final one is silently dropped.
+type analyzeRespWriter struct {
+	out         io.Writer
+	head        []byte
+	headWritten bool
+	heldNewline bool
+}
+
+func (w *analyzeRespWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if !w.headWritten {
+		if _, err := w.out.Write(w.head); err != nil {
+			return 0, err
+		}
+		w.headWritten = true
+	}
+	if w.heldNewline {
+		if _, err := w.out.Write(newlineSlice); err != nil {
+			return 0, err
+		}
+		w.heldNewline = false
+	}
+	n := len(p)
+	if p[n-1] == '\n' {
+		w.heldNewline = true
+		p = p[:n-1]
+		if len(p) == 0 {
+			return n, nil
+		}
+	}
+	if _, err := w.out.Write(p); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // buildProjectInput translates wire args into a pipeline.ProjectInput
@@ -158,6 +254,9 @@ func (s *daemonState) buildProjectInput(args daemon.AnalyzeProjectArgs) (pipelin
 			IncludeGenerated: args.IncludeGenerated,
 			Version:          kritVersion(),
 			OracleEnabled:    oracleDaemon != nil,
+			// Wire is line-delimited; compact JSON keeps the body
+			// free of internal newlines.
+			JSONCompact: true,
 		},
 		Host: pipeline.ProjectHostState{
 			ParseCache:              parseCache,
