@@ -7,7 +7,6 @@ import (
 )
 
 func TestFunctionComplexity_BaseIsOne(t *testing.T) {
-	// A linear function with no branches should have cyclomatic complexity 1.
 	lines := []string{
 		"fun greet(): String {",
 		"    return \"hello\"",
@@ -20,17 +19,14 @@ func TestFunctionComplexity_BaseIsOne(t *testing.T) {
 }
 
 func TestFunctionComplexity_BranchesIncrement(t *testing.T) {
-	// Each if/else-if/when/for/while/catch/&&/||/?: adds one. The line
-	// scanner is the same one used by the real CodeLens provider, so this
-	// guards the regex against accidental drift.
 	lines := []string{
-		"fun pick(x: Int, y: Int?): Int {",   // 1: base
-		"    if (x > 0 && y != null) {",      // 2: if + &&
-		"        for (i in 0..x) print(i)",   // 3: for
-		"    } else if (x < 0 || y == null) { ", // 4: else if + ||
+		"fun pick(x: Int, y: Int?): Int {",
+		"    if (x > 0 && y != null) {",
+		"        for (i in 0..x) print(i)",
+		"    } else if (x < 0 || y == null) { ",
 		"        return -1",
 		"    }",
-		"    return y ?: 0",                  // 5: ?:
+		"    return y ?: 0",
 		"}",
 	}
 	got := functionComplexity(lines, 1, len(lines)+1)
@@ -54,7 +50,6 @@ func TestFunctionComplexity_SkipsLineComments(t *testing.T) {
 
 func TestFunctionComplexity_HandlesOutOfRangeArgs(t *testing.T) {
 	lines := []string{"fun f() {}"}
-	// Caller passes nonsense bounds; helper must clamp rather than panic.
 	if got := functionComplexity(lines, 0, 999); got != 1 {
 		t.Errorf("complexity with bad bounds = %d, want 1", got)
 	}
@@ -157,18 +152,17 @@ func TestBuildFunctionCodeLenses_TitleAndRange(t *testing.T) {
 }
 
 func TestBuildFunctionCodeLenses_NeighborLimitsScanRange(t *testing.T) {
-	// Two functions in one file. The first lens's complexity must only
-	// count branches inside its own body, stopping at the second
-	// function's start line.
+	// The first lens's complexity must stop at the second function's
+	// start line; otherwise b's branches leak into a's score.
 	file := &scanner.File{
 		Path: "src/Two.kt",
 		Lines: []string{
-			"fun a() {",     // 1
-			"    val x = 1", // 2
-			"}",             // 3
-			"fun b() {",     // 4
-			"    if (x) {",  // 5
-			"        if (y) {}", // 6
+			"fun a() {",
+			"    val x = 1",
+			"}",
+			"fun b() {",
+			"    if (x) {",
+			"        if (y) {}",
 			"    }",
 			"}",
 		},

@@ -1,6 +1,9 @@
 package mcp
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestFormatList(t *testing.T) {
 	cases := []struct {
@@ -27,15 +30,6 @@ func TestFormatList(t *testing.T) {
 // The slices are the source of truth for tool schemas; a missing entry
 // silently breaks the dispatcher's enum validation.
 func TestDiscriminatorSlicesIncludeAllConstants(t *testing.T) {
-	contains := func(list []string, want string) bool {
-		for _, v := range list {
-			if v == want {
-				return true
-			}
-		}
-		return false
-	}
-
 	cases := []struct {
 		name  string
 		slice []string
@@ -55,7 +49,7 @@ func TestDiscriminatorSlicesIncludeAllConstants(t *testing.T) {
 				t.Fatalf("%s has %d entries, want %d", tc.name, len(tc.slice), len(tc.want))
 			}
 			for _, w := range tc.want {
-				if !contains(tc.slice, w) {
+				if !slices.Contains(tc.slice, w) {
 					t.Errorf("%s missing %q", tc.name, w)
 				}
 			}
