@@ -191,7 +191,9 @@ func (r *CommentedOutCodeBlockRule) check(ctx *api.Context) {
 		}
 
 		msg := fmt.Sprintf("Commented-out code block detected across %d consecutive lines; delete it or restore it as live code.", endLine-startLine)
-		ctx.Emit(r.Finding(file, startLine+1, col+1, msg))
+		f := r.Finding(file, startLine+1, col+1, msg)
+		f.Fix = deleteLineRangeFix(file, startLine, endLine-1)
+		ctx.Emit(f)
 		startLine = -1
 		count = 0
 	}
@@ -484,8 +486,42 @@ func (r *CommentedOutImportRule) checkNode(ctx *api.Context) {
 	if !commentedImportRe.MatchString(body) {
 		return
 	}
-	ctx.EmitAt(file.FlatRow(ctx.Idx)+1, 1,
+	row := file.FlatRow(ctx.Idx)
+	f := r.Finding(file, row+1, 1,
 		"Commented-out import; remove it or restore it as a live import.")
+	f.Fix = deleteLineFix(file, row)
+	ctx.Emit(f)
+}
+
+// deleteLineFix returns a byte-mode Fix that removes a single 0-indexed
+// row, including its trailing newline (or the preceding newline when the
+// line is the last in the file). Returns nil when the row is out of range.
+func deleteLineFix(file *scanner.File, row int) *scanner.Fix {
+	return deleteLineRangeFix(file, row, row)
+}
+
+// deleteLineRangeFix returns a byte-mode Fix that removes lines
+// [startRow, endRow] (inclusive, 0-indexed) along with their trailing
+// newlines. When the range reaches the end of the file with no trailing
+// newline, the preceding newline is consumed instead so neighboring lines
+// stay separated. Returns nil when the range is out of bounds.
+func deleteLineRangeFix(file *scanner.File, startRow, endRow int) *scanner.Fix {
+	if startRow < 0 || endRow < startRow || endRow >= len(file.Lines) {
+		return nil
+	}
+	start := file.LineOffset(startRow)
+	end := file.LineOffset(endRow) + len(file.Lines[endRow])
+	if end < len(file.Content) && file.Content[end] == '\n' {
+		end++
+	} else if start > 0 && file.Content[start-1] == '\n' {
+		start--
+	}
+	return &scanner.Fix{
+		ByteMode:    true,
+		StartByte:   start,
+		EndByte:     end,
+		Replacement: "",
+	}
 }
 
 // DebugToastInProductionRule flags Toast.makeText calls whose message literal
