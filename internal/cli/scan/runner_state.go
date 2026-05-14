@@ -389,6 +389,9 @@ func (r *runner) filterRules() (handled bool, code int) {
 	r.tracker.TrackVoid("filterRules", func() {
 		disabledSet := clishared.ParseRuleNameSetCSV(*r.f.DisableRules)
 		enabledSet := clishared.ParseRuleNameSetCSV(*r.f.EnableRules)
+		if *r.f.DisableRelated {
+			rules.ExpandWithRelated(disabledSet, api.Registry)
+		}
 		experimental := *r.f.Experimental || r.cfg.GetTopLevelBool("experimental", false)
 		r.activeRules = rules.ActiveRulesV2(disabledSet, enabledSet, *r.f.AllRules, experimental)
 		if maxCost, ok := resolveMaxCost(*r.f.MaxCost, r.cfg); ok {
