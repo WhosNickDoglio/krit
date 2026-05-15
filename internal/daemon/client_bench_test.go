@@ -39,6 +39,35 @@ func BenchmarkJSONUnmarshal_LargeFindingsEnvelope(b *testing.B) {
 	}
 }
 
+// BenchmarkScanAnalyzeProjectResponse measures the production fast
+// path the daemon client uses. Should run ~30x faster than the
+// json.Unmarshal baseline above on the same 30 MB envelope.
+func BenchmarkScanAnalyzeProjectResponse(b *testing.B) {
+	findings := bytes.Repeat([]byte(`{"file":"src/dir/File.kt","line":42,"col":1,"ruleSet":"style","rule":"MaxLineLength","severity":"warning","message":"Line exceeds maximum length","fixable":false,"confidence":0.75},`), 87_000)
+	findings = findings[:len(findings)-1]
+	body := `{"findings":[` + string(findings) + `],"stats":{"findings_count":87000,"wall_seconds":0.567}}`
+	resp := Response{OK: true, Data: json.RawMessage(body)}
+	envelope, err := json.Marshal(resp)
+	if err != nil {
+		b.Fatalf("marshal envelope: %v", err)
+	}
+	envelope = append(envelope, '\n')
+
+	b.ReportMetric(float64(len(envelope))/1024/1024, "MB/op")
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		var got AnalyzeProjectResult
+		handled, derr := ScanAnalyzeProjectResponse(envelope, &got)
+		if !handled {
+			b.Fatal("scan fell back")
+		}
+		if derr != nil {
+			b.Fatalf("scan: %v", derr)
+		}
+	}
+}
+
 // BenchmarkRawScan_FindEnvelopeBoundaries is the alternative path: a
 // hand-rolled parser that finds the `"data":` boundary and emits the
 // raw bytes verbatim, skipping json.Unmarshal entirely.

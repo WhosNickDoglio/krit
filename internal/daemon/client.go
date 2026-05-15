@@ -68,6 +68,18 @@ func Call(socketPath, verb string, args any, out any) error {
 	if err != nil {
 		return fmt.Errorf("daemon: read: %w", err)
 	}
+	// Fast path for analyze-project's giant 30 MB envelope: a hand-
+	// rolled byte scanner extracts Findings (json.RawMessage) and
+	// Stats (small struct) without paying the ~150 ms two-pass
+	// json.Unmarshal that the generic path costs on warm baselines.
+	// Falls back transparently to json.Unmarshal when the envelope
+	// shape doesn't match (different field order, whitespace, etc.).
+	if apr, ok := out.(*AnalyzeProjectResult); ok {
+		handled, daemonErr := ScanAnalyzeProjectResponse(line, apr)
+		if handled {
+			return daemonErr
+		}
+	}
 	var resp Response
 	if err := json.Unmarshal(line, &resp); err != nil {
 		return fmt.Errorf("daemon: decode response: %w", err)
