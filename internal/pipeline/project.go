@@ -20,6 +20,7 @@ import (
 	"github.com/kaeawc/krit/internal/javafacts"
 	"github.com/kaeawc/krit/internal/librarymodel"
 	"github.com/kaeawc/krit/internal/oracle"
+	"github.com/kaeawc/krit/internal/output"
 	"github.com/kaeawc/krit/internal/perf"
 	"github.com/kaeawc/krit/internal/rules"
 	api "github.com/kaeawc/krit/internal/rules/api"
@@ -228,6 +229,15 @@ type ProjectHostState struct {
 	// memo. nil is permitted and behaves like a constant 0 (no
 	// caching).
 	SourceMTimeVersion func() uint64
+	// BundleOutput / StoreBundleOutput are the daemon-side cache for
+	// pre-formatted bundle-hit JSON. When BundleOutput(key) returns
+	// non-nil, the bundle-hit OutputPhase short-circuit emits the
+	// cached findings bytes verbatim and rebuilds only the dynamic
+	// envelope fields (durationMs, perf stats). Skips ~24 ms of
+	// json.Marshal-equivalent byte concatenation on every warm
+	// analyze. *WorkspaceState satisfies both signatures.
+	BundleOutput      func(bundleKey string) *CachedBundleOutput
+	StoreBundleOutput func(bundleKey string, output *CachedBundleOutput)
 	// CrossFileCacheDir, when non-empty, enables the on-disk cross-file
 	// CodeIndex cache (zstd-encoded shards under .krit/crossfile-cache).
 	// Independent of CodeIndexCache: the disk cache is shared across
@@ -1599,6 +1609,25 @@ func tryLoadFindingsBundleBeforeParse(
 		}
 		return ProjectResult{}, false, nil
 	}
+
+	// Fast-fast path: when the formatted-output cache already has
+	// bytes for this fingerprint we can skip the 30 MB
+	// FindingsBundleStore.Load entirely (~11 ms zstd+gob decode).
+	// The cached bytes are derived purely from the (FindingColumns,
+	// active rules) pair the fingerprint already encodes, so by
+	// definition they're valid for this request. Eligibility mirrors
+	// the format-cache fast path's filter preconditions below.
+	if canUseBundleOutputCache(args, host) {
+		if cachedOut := host.BundleOutput(scanner.FindingsBundleKey(fp)); cachedOut != nil {
+			if bundleTracker != nil {
+				bundleTracker.TrackVoid("bundleLoadSkipped", func() {})
+				bundleTracker.End()
+			}
+			return emitBundleHitOutput(ctx, args, host, out, format, startTime, phaseTimings,
+				fp, nil, kotlinFiles, javaFiles)
+		}
+	}
+
 	var cached *scanner.FindingColumns
 	loadFn := func() {
 		c, found := host.FindingsBundleStore.Load(host.FindingsBundleCacheRoot, fp)
@@ -1620,8 +1649,44 @@ func tryLoadFindingsBundleBeforeParse(
 		return ProjectResult{}, false, nil
 	}
 
+	return emitBundleHitOutput(ctx, args, host, out, format, startTime, phaseTimings,
+		fp, cached, kotlinFiles, javaFiles)
+}
+
+// emitBundleHitOutput dispatches the bundle-hit response: cached
+// findings bytes via serveBundleHitFromOutputCache when eligible,
+// otherwise the full OutputPhase route. Extracted so
+// tryLoadFindingsBundleBeforeParse stays under the cyclomatic-
+// complexity gate.
+func emitBundleHitOutput(
+	ctx context.Context,
+	args ProjectArgs,
+	host ProjectHostState,
+	out io.Writer,
+	format string,
+	startTime time.Time,
+	phaseTimings *PhaseTimingsMs,
+	fp scanner.RunFingerprint,
+	cached *scanner.FindingColumns,
+	kotlinFiles, javaFiles []*scanner.File,
+) (ProjectResult, bool, error) {
 	perfTimings, caches, budget := capturePerfOutputs(args, host)
 	outputStart := time.Now()
+
+	if canUseBundleOutputCache(args, host) {
+		res, fastOK, fastErr := serveBundleHitFromOutputCache(
+			cached, fp, kotlinFiles, javaFiles, args, host, out,
+			startTime, perfTimings, caches, budget)
+		if fastOK || fastErr != nil {
+			if phaseTimings != nil {
+				phaseTimings.Output = time.Since(outputStart).Milliseconds()
+			}
+			return res, fastOK, fastErr
+		}
+		// fastOK=false with nil error means the cache build path
+		// declined (e.g. degenerate FindingColumns) — fall through
+		// to OutputPhase for correctness.
+	}
 	outResult, err := OutputPhase{}.Run(ctx, OutputInput{
 		FixupResult: FixupResult{
 			CrossFileResult: CrossFileResult{
@@ -1668,6 +1733,166 @@ func tryLoadFindingsBundleBeforeParse(
 		PhaseTimingsMs:    *phaseTimings,
 	}, true, nil
 }
+
+// canUseBundleOutputCache reports whether the bundle-hit fast path
+// (cached findings JSON + handwritten envelope) is safe for this
+// request. The cached bytes are derived purely from the
+// FindingColumns + active rules — anything that mutates the
+// post-bundle column set (baseline filter, diff filter, severity
+// promotion, min-confidence threshold) makes them incorrect, so
+// those cases fall back to the regular OutputPhase route.
+func canUseBundleOutputCache(args ProjectArgs, host ProjectHostState) bool {
+	if host.BundleOutput == nil || host.StoreBundleOutput == nil {
+		return false
+	}
+	if args.Format != "json" || !args.JSONCompact {
+		return false
+	}
+	if args.BaselinePath != "" || args.DiffRef != "" {
+		return false
+	}
+	if args.WarningsAsErrors || args.MinConfidence > 0 {
+		return false
+	}
+	return true
+}
+
+// serveBundleHitFromOutputCache emits the bundle-hit response using
+// pre-formatted findings bytes when available, or formats once and
+// caches the result. Returns (result, true, nil) on success,
+// (zero, false, nil) on a soft-fall-through (e.g. cache infrastructure
+// gave us a nil cache entry on miss-store), or (zero, true, err) on
+// a hard write error.
+func serveBundleHitFromOutputCache(
+	cached *scanner.FindingColumns,
+	fp scanner.RunFingerprint,
+	kotlinFiles, javaFiles []*scanner.File,
+	args ProjectArgs,
+	host ProjectHostState,
+	out io.Writer,
+	startTime time.Time,
+	perfTimings []perf.TimingEntry,
+	caches []cacheutil.NamedCacheStats,
+	cacheBudget *cacheutil.BudgetReport,
+) (ProjectResult, bool, error) {
+	key := scanner.FindingsBundleKey(fp)
+	if key == "" {
+		return ProjectResult{}, false, nil
+	}
+	out2 := host.BundleOutput(key)
+	if out2 == nil {
+		// Cache miss: must have the decoded FindingColumns to
+		// build the formatted bytes. Caller is responsible for
+		// loading the bundle before calling on a cache miss.
+		if cached == nil {
+			return ProjectResult{}, false, nil
+		}
+		built, ok := buildCachedBundleOutput(cached, args.ActiveRules)
+		if !ok {
+			return ProjectResult{}, false, nil
+		}
+		host.StoreBundleOutput(key, built)
+		out2 = built
+	}
+
+	durationMs := time.Since(startTime).Milliseconds()
+	summary := JSONSummary{
+		Total:     out2.Total,
+		ByRuleSet: out2.ByRuleSet,
+		ByRule:    out2.ByRule,
+		Fixable:   out2.FixableCount,
+	}
+	if err := writeBundleHitCompactJSON(out, args, len(kotlinFiles)+len(javaFiles), len(args.ActiveRules),
+		durationMs, summary, out2.FindingsBytes, perfTimings, caches, cacheBudget); err != nil {
+		return ProjectResult{}, true, fmt.Errorf("output: %w", err)
+	}
+	// FinalFindings carries the decoded columns when available
+	// (cache miss path that just built them). On the fast-fast
+	// path where we skipped the bundle Load, the caller doesn't
+	// need the column data — only FindingsCount, which we read
+	// from out2.Total.
+	var finalFindings scanner.FindingColumns
+	if cached != nil {
+		finalFindings = *cached
+	}
+	return ProjectResult{
+		FinalFindings:     finalFindings,
+		FilesScanned:      len(kotlinFiles) + len(javaFiles),
+		FindingsCount:     out2.Total,
+		FindingsBundleHit: true,
+	}, true, nil
+}
+
+// buildCachedBundleOutput formats the bundle's findings into a
+// reusable byte buffer + summary. Mirrors what FormatJSONColumnsCompact
+// does for the findings array, but exposes the bytes so the daemon
+// can stash them on WorkspaceState. ok=false on degenerate input
+// so the caller can fall back to OutputPhase.
+func buildCachedBundleOutput(cached *scanner.FindingColumns, activeRules []*api.Rule) (*CachedBundleOutput, bool) {
+	if cached == nil {
+		return nil, false
+	}
+	fixLevels := make(map[string]string)
+	efforts := make(map[string]string)
+	for _, r := range activeRules {
+		if r == nil {
+			continue
+		}
+		if lvl, ok := rules.GetV2FixLevel(r); ok {
+			fixLevels[r.ID] = lvl.String()
+		}
+		if e := rules.V2RuleEffort(r); e != api.EffortUnset {
+			efforts[r.ID] = e.String()
+		}
+	}
+	byRuleSet := make(map[string]int)
+	byRule := make(map[string]int)
+	fixableCount := 0
+	findingsBytes := output.BuildFindingsArrayCompact(cached, fixLevels, efforts, byRuleSet, byRule, &fixableCount)
+	return &CachedBundleOutput{
+		FindingsBytes: findingsBytes,
+		Total:         cached.Len(),
+		ByRuleSet:     byRuleSet,
+		ByRule:        byRule,
+		FixableCount:  fixableCount,
+	}, true
+}
+
+// writeBundleHitCompactJSON emits the report envelope using the
+// pre-formatted findingsBytes verbatim. Mirrors
+// output.writeCompactReport's shape so the wire format is identical
+// to the OutputPhase route a non-cacheable request would take.
+func writeBundleHitCompactJSON(
+	w io.Writer,
+	args ProjectArgs,
+	fileCount, ruleCount int,
+	durationMs int64,
+	summary JSONSummary,
+	findingsBytes []byte,
+	perfTimings []perf.TimingEntry,
+	caches []cacheutil.NamedCacheStats,
+	cacheBudget *cacheutil.BudgetReport,
+) error {
+	return output.WriteCompactReport(w, output.CompactReport{
+		Success:      summary.Total == 0,
+		Version:      args.Version,
+		DurationMs:   durationMs,
+		FileCount:    fileCount,
+		RuleCount:    ruleCount,
+		Experiments:  args.ExperimentNames,
+		FindingsJSON: findingsBytes,
+		Summary:      summary,
+		Caches:       caches,
+		CacheBudget:  cacheBudget,
+		PerfTimings:  perfTimings,
+	})
+}
+
+// JSONSummary mirrors output.JSONSummary so the bundle-hit fast
+// path can construct one without an import cycle. Use a type alias
+// to keep semantics in sync — any future field added to the output
+// package's struct surfaces automatically here.
+type JSONSummary = output.JSONSummary
 
 // preparseBundleFingerprintTracked computes the bundle fingerprint
 // used to decide whether the warm findings-bundle path can serve the
