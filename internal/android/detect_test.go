@@ -127,6 +127,44 @@ func TestDetectProject_NonExistentPath(t *testing.T) {
 	}
 }
 
+// TestDetectProject_RelativeDotRoot_FindsGradle pins the fix for the
+// daemon-vs-in-process divergence flagged by the strict-verify
+// harness: with scanPaths=["."], detectWalkDir used to SkipDir on
+// the root entry itself because d.Name() is "." (matches the
+// hidden-dir prefix guard intended for .git/.gradle/etc.). The CLI
+// hits this path when run from the project's CWD with no explicit
+// argument; the daemon doesn't because cmd/krit-daemon always
+// resolves --repo to an absolute path before passing it through.
+//
+// Repro shape: a directory with a build.gradle.kts and a
+// settings.gradle.kts (no .git, no manifest) must yield GradlePaths
+// of length 1 when probed with ".".
+func TestDetectProject_RelativeDotRoot_FindsGradle(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "build.gradle.kts"), []byte("dependencies {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.gradle.kts"), []byte("rootProject.name = \"x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Switch CWD into the tempdir so scanPaths=["."] resolves there.
+	// Restore on cleanup; t.TempDir cleanup expects an existing CWD.
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+
+	proj := DetectProject([]string{"."})
+	if len(proj.GradlePaths) != 1 {
+		t.Fatalf("expected 1 GradlePath with root=\".\", got %d (project=%+v)", len(proj.GradlePaths), proj)
+	}
+}
+
 func TestDetectProjectWithIndex_UsesTrackedFileListing(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "app", "src", "main", "res", "layout"), 0o755); err != nil {
