@@ -34,6 +34,19 @@ func DetectProjectWithIndex(scanPaths []string, index trackedfiles.Index) *Proje
 	seen := make(map[string]bool)
 
 	for _, root := range scanPaths {
+		// Resolve to absolute up front: detectWalkDir SkipDirs any
+		// directory whose Name() starts with "." (catches .git,
+		// .gradle, etc.). When the caller passes "." as the root —
+		// which the CLI does when run from the project's CWD with
+		// no explicit path — WalkDir's first callback receives a
+		// DirEntry whose Name() is "." and the SkipDir fires on the
+		// root itself, leaving GradlePaths / ManifestPaths empty
+		// and silently dropping every Gradle/Android rule. abs is
+		// always a real basename so the hidden-dir guard targets
+		// only the dotfiles we mean to skip.
+		if abs, err := filepath.Abs(root); err == nil {
+			root = abs
+		}
 		info, err := os.Stat(root)
 		if err != nil {
 			continue
