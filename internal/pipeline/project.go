@@ -1402,20 +1402,63 @@ func runDispatchOrLoadBundle(
 	bundleEnabled bool,
 	manifest deltaManifestData,
 ) (DispatchResult, CrossFileResult, bool, dispatchTimings, error) {
+	// Track the bundle-fast-paths so --perf shows where a warm
+	// "nothing structurally changed" analyze spends its 100-300 ms —
+	// most of it is the disk-backed bundle Load. Without these
+	// scopes the post-parse bundle hit shows up as unattributed time
+	// under crossFileAnalysis (the parent scope opened in
+	// runProjectIndexPhase wraps the entire IndexPhase + dispatch
+	// flow, so a bundle hit halfway through leaves a "gap" with no
+	// children for the user to investigate).
+	tracker := host.Tracker
+	tracked := tracker != nil && tracker.IsEnabled()
 	if bundleEnabled {
-		if cached, ok := host.FindingsBundleStore.Load(host.FindingsBundleCacheRoot, runFP); ok && cached != nil {
+		var cached *scanner.FindingColumns
+		var ok bool
+		loadFn := func() {
+			cached, ok = host.FindingsBundleStore.Load(host.FindingsBundleCacheRoot, runFP)
+		}
+		if tracked {
+			tracker.TrackVoid("dispatchBundleLoad", loadFn)
+		} else {
+			loadFn()
+		}
+		if ok && cached != nil {
 			d := DispatchResult{IndexResult: indexResult, Findings: *cached}
 			return d, CrossFileResult{DispatchResult: d}, true, dispatchTimings{}, nil
 		}
-		if cached, ok := tryLoadStructurallyStableBundle(host, runFP, manifest); ok && cached != nil {
-			d := DispatchResult{IndexResult: indexResult, Findings: *cached}
+		var stableCached *scanner.FindingColumns
+		var stableOK bool
+		stableFn := func() {
+			stableCached, stableOK = tryLoadStructurallyStableBundle(host, runFP, manifest)
+		}
+		if tracked {
+			tracker.TrackVoid("dispatchStableBundleLoad", stableFn)
+		} else {
+			stableFn()
+		}
+		if stableOK && stableCached != nil {
+			d := DispatchResult{IndexResult: indexResult, Findings: *stableCached}
 			return d, CrossFileResult{DispatchResult: d}, true, dispatchTimings{}, nil
 		}
 		reportFindingsBundleMiss(host, manifest, runFP)
-		if d, c, ok, err := tryDeltaDispatch(ctx, args, host, indexResult, parseResult, runFP, manifest); err != nil {
-			return DispatchResult{}, CrossFileResult{}, false, dispatchTimings{}, err
-		} else if ok {
-			return d, c, false, dispatchTimings{}, nil
+		var deltaD DispatchResult
+		var deltaC CrossFileResult
+		var deltaOK bool
+		var deltaErr error
+		deltaFn := func() {
+			deltaD, deltaC, deltaOK, deltaErr = tryDeltaDispatch(ctx, args, host, indexResult, parseResult, runFP, manifest)
+		}
+		if tracked {
+			tracker.TrackVoid("dispatchDeltaPath", deltaFn)
+		} else {
+			deltaFn()
+		}
+		if deltaErr != nil {
+			return DispatchResult{}, CrossFileResult{}, false, dispatchTimings{}, deltaErr
+		}
+		if deltaOK {
+			return deltaD, deltaC, false, dispatchTimings{}, nil
 		}
 	}
 	dispatchStart := time.Now()
