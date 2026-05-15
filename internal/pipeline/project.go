@@ -1306,6 +1306,16 @@ func runAndroidPhaseAndMerge(ctx context.Context, args ProjectArgs, host Project
 	dispatcher := rules.NewDispatcher(args.ActiveRules, indexResult.Resolver)
 	dispatcher.SetLibraryFacts(indexResult.LibraryFacts)
 	dispatcher.SetJavaSemanticFacts(indexResult.JavaSemanticFacts)
+	// Hand AndroidPhase a child tracker so its gradleAnalysis /
+	// manifestAnalysis / resourceAnalysis sub-scopes nest under
+	// "androidPhase" in the --perf tree. Without this the sub-scopes
+	// would sit at the top level alongside crossFileAnalysis (or vanish
+	// entirely when in.Tracker is nil) — on a kotlin-style monorepo
+	// that's 1+ seconds of otherwise-invisible time.
+	var androidTracker perf.Tracker
+	if host.Tracker != nil && host.Tracker.IsEnabled() {
+		androidTracker = host.Tracker.Serial("androidPhase")
+	}
 	res, err := (AndroidPhase{}).Run(ctx, AndroidInput{
 		Project:             project,
 		ActiveRules:         args.ActiveRules,
@@ -1320,7 +1330,11 @@ func runAndroidPhaseAndMerge(ctx context.Context, args ProjectArgs, host Project
 		CacheDir:            host.AndroidCacheDir,
 		CacheWriter:         host.AndroidCacheWriter,
 		GradleFindingsCache: host.GradleFindingsCache,
+		Tracker:             androidTracker,
 	})
+	if androidTracker != nil {
+		androidTracker.End()
+	}
 	if err != nil {
 		return fmt.Errorf("android: %w", err)
 	}
