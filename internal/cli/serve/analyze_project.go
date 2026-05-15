@@ -13,6 +13,7 @@ import (
 	"github.com/kaeawc/krit/internal/cli/clishared"
 	"github.com/kaeawc/krit/internal/config"
 	"github.com/kaeawc/krit/internal/daemon"
+	"github.com/kaeawc/krit/internal/perf"
 	"github.com/kaeawc/krit/internal/pipeline"
 	"github.com/kaeawc/krit/internal/rules"
 	"github.com/kaeawc/krit/internal/scanner"
@@ -300,6 +301,16 @@ func (s *daemonState) buildProjectInput(args daemon.AnalyzeProjectArgs) (pipelin
 	// in that case the pipeline falls back to recomputing per-file.
 	priorManifest, _ := s.priorManifest(repoDir, paths)
 
+	// Build a perf.Tracker only when the caller asked for --perf or
+	// --perf-rules. A nil-interface (untyped) Tracker keeps every
+	// pipeline.host.Tracker check a no-op; constructing one
+	// unconditionally would steal the noopTracker fast path the
+	// non-perf hot path relies on.
+	var perfTracker perf.Tracker
+	if args.ShowPerf || args.PerfRules {
+		perfTracker = perf.New(true)
+	}
+
 	return pipeline.ProjectInput{
 		Args: pipeline.ProjectArgs{
 			Config:           cfg,
@@ -315,6 +326,8 @@ func (s *daemonState) buildProjectInput(args daemon.AnalyzeProjectArgs) (pipelin
 			IncludeGenerated: args.IncludeGenerated,
 			Version:          kritVersion(),
 			OracleEnabled:    oracleDaemon != nil,
+			ShowPerf:         args.ShowPerf || args.PerfRules,
+			PerfRules:        args.PerfRules,
 			// Wire is line-delimited; compact JSON keeps the body
 			// free of internal newlines.
 			JSONCompact: true,
@@ -322,6 +335,7 @@ func (s *daemonState) buildProjectInput(args daemon.AnalyzeProjectArgs) (pipelin
 		Host: pipeline.ProjectHostState{
 			ParseCache:                   parseCache,
 			ResidentFiles:                s.workspace,
+			Tracker:                      perfTracker,
 			LibraryFactsCache:            s.workspace.LibraryFacts,
 			CodeIndexCache:               s.workspace.CodeIndex,
 			ResolverCache:                s.workspace.Resolver,

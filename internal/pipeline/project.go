@@ -1306,6 +1306,16 @@ func runAndroidPhaseAndMerge(ctx context.Context, args ProjectArgs, host Project
 	dispatcher := rules.NewDispatcher(args.ActiveRules, indexResult.Resolver)
 	dispatcher.SetLibraryFacts(indexResult.LibraryFacts)
 	dispatcher.SetJavaSemanticFacts(indexResult.JavaSemanticFacts)
+	// Hand AndroidPhase a child tracker so its gradleAnalysis /
+	// manifestAnalysis / resourceAnalysis sub-scopes nest under
+	// "androidPhase" in the --perf tree. Without this the sub-scopes
+	// would sit at the top level alongside crossFileAnalysis (or vanish
+	// entirely when in.Tracker is nil) — on a kotlin-style monorepo
+	// that's 1+ seconds of otherwise-invisible time.
+	var androidTracker perf.Tracker
+	if host.Tracker != nil && host.Tracker.IsEnabled() {
+		androidTracker = host.Tracker.Serial("androidPhase")
+	}
 	res, err := (AndroidPhase{}).Run(ctx, AndroidInput{
 		Project:             project,
 		ActiveRules:         args.ActiveRules,
@@ -1320,7 +1330,11 @@ func runAndroidPhaseAndMerge(ctx context.Context, args ProjectArgs, host Project
 		CacheDir:            host.AndroidCacheDir,
 		CacheWriter:         host.AndroidCacheWriter,
 		GradleFindingsCache: host.GradleFindingsCache,
+		Tracker:             androidTracker,
 	})
+	if androidTracker != nil {
+		androidTracker.End()
+	}
 	if err != nil {
 		return fmt.Errorf("android: %w", err)
 	}
@@ -1388,20 +1402,63 @@ func runDispatchOrLoadBundle(
 	bundleEnabled bool,
 	manifest deltaManifestData,
 ) (DispatchResult, CrossFileResult, bool, dispatchTimings, error) {
+	// Track the bundle-fast-paths so --perf shows where a warm
+	// "nothing structurally changed" analyze spends its 100-300 ms —
+	// most of it is the disk-backed bundle Load. Without these
+	// scopes the post-parse bundle hit shows up as unattributed time
+	// under crossFileAnalysis (the parent scope opened in
+	// runProjectIndexPhase wraps the entire IndexPhase + dispatch
+	// flow, so a bundle hit halfway through leaves a "gap" with no
+	// children for the user to investigate).
+	tracker := host.Tracker
+	tracked := tracker != nil && tracker.IsEnabled()
 	if bundleEnabled {
-		if cached, ok := host.FindingsBundleStore.Load(host.FindingsBundleCacheRoot, runFP); ok && cached != nil {
+		var cached *scanner.FindingColumns
+		var ok bool
+		loadFn := func() {
+			cached, ok = host.FindingsBundleStore.Load(host.FindingsBundleCacheRoot, runFP)
+		}
+		if tracked {
+			tracker.TrackVoid("dispatchBundleLoad", loadFn)
+		} else {
+			loadFn()
+		}
+		if ok && cached != nil {
 			d := DispatchResult{IndexResult: indexResult, Findings: *cached}
 			return d, CrossFileResult{DispatchResult: d}, true, dispatchTimings{}, nil
 		}
-		if cached, ok := tryLoadStructurallyStableBundle(host, runFP, manifest); ok && cached != nil {
-			d := DispatchResult{IndexResult: indexResult, Findings: *cached}
+		var stableCached *scanner.FindingColumns
+		var stableOK bool
+		stableFn := func() {
+			stableCached, stableOK = tryLoadStructurallyStableBundle(host, runFP, manifest)
+		}
+		if tracked {
+			tracker.TrackVoid("dispatchStableBundleLoad", stableFn)
+		} else {
+			stableFn()
+		}
+		if stableOK && stableCached != nil {
+			d := DispatchResult{IndexResult: indexResult, Findings: *stableCached}
 			return d, CrossFileResult{DispatchResult: d}, true, dispatchTimings{}, nil
 		}
 		reportFindingsBundleMiss(host, manifest, runFP)
-		if d, c, ok, err := tryDeltaDispatch(ctx, args, host, indexResult, parseResult, runFP, manifest); err != nil {
-			return DispatchResult{}, CrossFileResult{}, false, dispatchTimings{}, err
-		} else if ok {
-			return d, c, false, dispatchTimings{}, nil
+		var deltaD DispatchResult
+		var deltaC CrossFileResult
+		var deltaOK bool
+		var deltaErr error
+		deltaFn := func() {
+			deltaD, deltaC, deltaOK, deltaErr = tryDeltaDispatch(ctx, args, host, indexResult, parseResult, runFP, manifest)
+		}
+		if tracked {
+			tracker.TrackVoid("dispatchDeltaPath", deltaFn)
+		} else {
+			deltaFn()
+		}
+		if deltaErr != nil {
+			return DispatchResult{}, CrossFileResult{}, false, dispatchTimings{}, deltaErr
+		}
+		if deltaOK {
+			return deltaD, deltaC, false, dispatchTimings{}, nil
 		}
 	}
 	dispatchStart := time.Now()
@@ -1501,14 +1558,42 @@ func tryLoadFindingsBundleBeforeParse(
 		return ProjectResult{}, false, nil
 	}
 	start := time.Now()
-	fp, kotlinFiles, javaFiles, ok := preparseBundleFingerprint(args, host)
+	// Wrap the warm-path bundle work in a serial tracker scope so
+	// --perf surfaces the warm-baseline cost ("manifestLoad",
+	// "fileStatsMatch", "bundleLoad", ...) as nested children of
+	// "bundleHit" — sibling scopes would double-count against the
+	// top-level total.
+	var bundleTracker perf.Tracker
+	if host.Tracker != nil && host.Tracker.IsEnabled() {
+		bundleTracker = host.Tracker.Serial("bundleHit")
+	}
+	fp, kotlinFiles, javaFiles, ok := preparseBundleFingerprintTracked(args, host, bundleTracker)
 	if phaseTimings != nil {
 		phaseTimings.Parse = time.Since(start).Milliseconds()
 	}
 	if !ok {
+		if bundleTracker != nil {
+			bundleTracker.End()
+		}
 		return ProjectResult{}, false, nil
 	}
-	cached, ok := host.FindingsBundleStore.Load(host.FindingsBundleCacheRoot, fp)
+	var cached *scanner.FindingColumns
+	loadFn := func() {
+		c, found := host.FindingsBundleStore.Load(host.FindingsBundleCacheRoot, fp)
+		if found {
+			cached = c
+		} else {
+			ok = false
+		}
+	}
+	if bundleTracker != nil {
+		bundleTracker.TrackVoid("bundleLoad", loadFn)
+	} else {
+		loadFn()
+	}
+	if bundleTracker != nil {
+		bundleTracker.End()
+	}
 	if !ok || cached == nil {
 		return ProjectResult{}, false, nil
 	}
@@ -1562,25 +1647,53 @@ func tryLoadFindingsBundleBeforeParse(
 	}, true, nil
 }
 
-func preparseBundleFingerprint(args ProjectArgs, host ProjectHostState) (scanner.RunFingerprint, []*scanner.File, []*scanner.File, bool) {
+// preparseBundleFingerprintTracked computes the bundle fingerprint
+// used to decide whether the warm findings-bundle path can serve the
+// request. When tracker is non-nil, sub-steps record their
+// wall-clock under "manifestLoad", "sourcePaths", "fileStatsMatch",
+// and "projectFingerprints" so --perf can show where warm-path
+// bundle fingerprinting spends time. tracker may be nil (CLI path /
+// non-perf calls), in which case the scopes are elided to keep the
+// hot path zero-overhead.
+func preparseBundleFingerprintTracked(args ProjectArgs, host ProjectHostState, tracker perf.Tracker) (scanner.RunFingerprint, []*scanner.File, []*scanner.File, bool) {
+	track := func(name string, fn func()) {
+		if tracker == nil {
+			fn()
+			return
+		}
+		tracker.TrackVoid(name, fn)
+	}
+
 	key := scanner.FindingsBundleManifestKey(host.FindingsBundleCacheRoot, args.Paths)
 	if key == "" {
 		return scanner.RunFingerprint{}, nil, nil, false
 	}
-	prior, ok := loadBundleManifest(host, key)
+	var (
+		prior scanner.FindingsBundleManifest
+		ok    bool
+	)
+	track("manifestLoad", func() { prior, ok = loadBundleManifest(host, key) })
 	if !ok || len(prior.StructuralFPs) == 0 {
 		return scanner.RunFingerprint{}, nil, nil, false
 	}
-	kotlinPaths, javaPaths, ok := preparseSourcePaths(args, host, prior)
+	var kotlinPaths, javaPaths []string
+	track("sourcePaths", func() {
+		kotlinPaths, javaPaths, ok = preparseSourcePaths(args, host, prior)
+	})
 	if !ok {
 		return scanner.RunFingerprint{}, nil, nil, false
 	}
 	paths := append(append([]string(nil), kotlinPaths...), javaPaths...)
-	if !fileStatsMatch(paths, prior.FileStats) {
+	var statsOK bool
+	track("fileStatsMatch", func() { statsOK = fileStatsMatch(paths, prior.FileStats) })
+	if !statsOK {
 		return scanner.RunFingerprint{}, nil, nil, false
 	}
 	rulesHash := projectRuleHash(args.ActiveRules, args.Config)
-	androidFP, libraryFactsFP := preparseProjectFingerprints(args, host)
+	var androidFP, libraryFactsFP string
+	track("projectFingerprints", func() {
+		androidFP, libraryFactsFP = preparseProjectFingerprints(args, host)
+	})
 	fp := scanner.RunFingerprint{
 		Version:      args.Version,
 		Rules:        rulesHash,

@@ -182,6 +182,17 @@ type AnalyzeProjectArgs struct {
 	// disables the handshake (back-compat for clients that don't
 	// know their hash).
 	ClientBinaryHash string `json:"client_binary_hash,omitempty"`
+	// ShowPerf mirrors --perf: when true the daemon wires a
+	// perf.Tracker into the pipeline so OutputPhase emits the
+	// hierarchical timing tree in the JSON header (under
+	// "performance"). PerfRules + ProfileDispatch ride on top of
+	// this flag — both require ShowPerf to be true.
+	ShowPerf bool `json:"show_perf,omitempty"`
+	// PerfRules mirrors --perf-rules: when true (and ShowPerf is
+	// true) the daemon also returns the per-rule execution-stat
+	// ranking. Requires the dispatcher to record per-rule timings,
+	// which the tracker arms automatically when active.
+	PerfRules bool `json:"perf_rules,omitempty"`
 }
 
 // AnalyzeProjectResult is the response payload. Findings is the raw

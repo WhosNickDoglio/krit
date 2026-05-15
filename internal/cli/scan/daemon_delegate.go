@@ -62,11 +62,18 @@ func tryDaemonDelegate(f *scanFlags, paths []string, repoDir string) (bool, int)
 // invoke profiling, or run meta commands stay on the in-process path.
 // Order kept as named groups so a future flag's owner can decide which
 // bucket their flag belongs in.
+//
+// --perf and --perf-rules ARE compatible: the daemon wires its own
+// perf.Tracker when ShowPerf is set in args, and OutputPhase emits the
+// hierarchical timing tree in the JSON envelope just like in-process.
+// --profile-dispatch stays in-process because the per-file timing
+// fan-out it needs is recorded against the *rules.Dispatcher state and
+// isn't currently surfaced through the daemon wire.
 func daemonCompatibleFlags(f *scanFlags) bool {
 	mutating := []bool{*f.Fix, *f.DryRun, *f.RemoveDeadCode, *f.FixBinary}
 	meta := []bool{*f.Init, *f.Doctor, *f.Version, *f.List, *f.ValidateConfig, *f.GenerateSchema,
 		*f.BaselineAudit, *f.RuleAudit, *f.OracleFilterFingerprint, *f.ListExperiments}
-	profiling := []bool{*f.Perf, *f.PerfRules, *f.ProfileDispatch}
+	profiling := []bool{*f.ProfileDispatch}
 	cacheOps := []bool{*f.NoCache, *f.ClearCache, *f.ClearMatrixCache}
 	for _, group := range [][]bool{mutating, meta, profiling, cacheOps} {
 		for _, on := range group {
@@ -107,6 +114,8 @@ func buildDaemonAnalyzeArgs(f *scanFlags, paths []string) daemon.AnalyzeProjectA
 		Experimental:     *f.Experimental,
 		EnableRules:      *f.EnableRules,
 		DisableRules:     *f.DisableRules,
+		ShowPerf:         *f.Perf || *f.PerfRules,
+		PerfRules:        *f.PerfRules,
 		ClientBinaryHash: daemonclient.CurrentBinaryHash(),
 	}
 }

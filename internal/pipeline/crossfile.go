@@ -174,8 +174,23 @@ func (p CrossFilePhase) runCrossPhase(ctx context.Context, in DispatchResult, co
 			in.Reporter.Verbosef("verbose: Cross-file findings cache: HIT (%d findings)\n", in.WarmCrossFindings.Len())
 		}
 	} else if crossFindingsCacheable && in.CrossFindingsCacheDir != "" {
-		if cached, ok := scanner.LoadCrossFindings(in.CrossFindingsCacheDir, crossFindingsKey); ok {
-			crossCollector.AppendColumns(&cached)
+		var cached scanner.FindingColumns
+		var hit bool
+		loadFn := func() {
+			cached, hit = scanner.LoadCrossFindings(in.CrossFindingsCacheDir, crossFindingsKey)
+		}
+		if crossTracker != nil {
+			crossTracker.TrackVoid("crossFindingsLoad", loadFn)
+		} else {
+			loadFn()
+		}
+		if hit {
+			appendFn := func() { crossCollector.AppendColumns(&cached) }
+			if crossTracker != nil {
+				crossTracker.TrackVoid("crossFindingsAppend", appendFn)
+			} else {
+				appendFn()
+			}
 			crossFindingsCacheHit = true
 			if in.Reporter != nil {
 				in.Reporter.Verbosef("verbose: Cross-file findings cache: HIT (%d findings)\n", cached.Len())
@@ -267,23 +282,55 @@ func (p CrossFilePhase) Run(ctx context.Context, in DispatchResult) (CrossFileRe
 	hasIndexBackedCrossFileRule, hasParsedFilesRule := p.classifyCrossFileNeeds(in.ActiveRules)
 	moduleNeeds := rules.CollectModuleAwareNeeds(in.ActiveRules)
 
+	// The cross-file tracker scope (when present) is the
+	// "crossFileAnalysis" parent that IndexPhase wired up; nesting
+	// our scopes under it keeps the perf tree single-rooted so
+	// callers see "where did crossFileAnalysis spend its 2 s"
+	// without scanning sibling lists.
+	crossTracker := in.CrossFileParentTracker
+	track := func(name string, fn func()) {
+		if crossTracker != nil {
+			crossTracker.TrackVoid(name, fn)
+		} else {
+			fn()
+		}
+	}
+	trackErr := func(name string, fn func() error) error {
+		if crossTracker != nil {
+			return crossTracker.Track(name, fn)
+		}
+		return fn()
+	}
+
 	needsCodeIndex := hasIndexBackedCrossFileRule && in.WarmCrossFindings == nil
 	if moduleNeeds.NeedsIndex {
 		needsCodeIndex = true
 	}
-	codeIndex := p.buildOrReuseCodeIndex(in, needsCodeIndex)
+	var codeIndex *scanner.CodeIndex
+	track("buildOrReuseCodeIndex", func() {
+		codeIndex = p.buildOrReuseCodeIndex(in, needsCodeIndex)
+	})
 	if codeIndex != in.CodeIndex && codeIndex != nil {
 		result.CodeIndex = codeIndex
 	}
 
 	crossCollector := scanner.NewFindingCollector(0)
-	crossFindingsSuppressed := p.collectCrossFileFindings(ctx, in, codeIndex, hasIndexBackedCrossFileRule, hasParsedFilesRule, crossCollector, &result)
+	var crossFindingsSuppressed bool
+	track("collectCrossFileFindings", func() {
+		crossFindingsSuppressed = p.collectCrossFileFindings(ctx, in, codeIndex, hasIndexBackedCrossFileRule, hasParsedFilesRule, crossCollector, &result)
+	})
 	moduleCollector := scanner.NewFindingCollector(0)
-	p.collectModuleAwareFindings(in, moduleCollector)
-	if err := p.collectModuleIndexFindings(ctx, in, codeIndex, moduleCollector, &result); err != nil {
+	track("collectModuleAwareFindings", func() {
+		p.collectModuleAwareFindings(in, moduleCollector)
+	})
+	if err := trackErr("collectModuleIndexFindings", func() error {
+		return p.collectModuleIndexFindings(ctx, in, codeIndex, moduleCollector, &result)
+	}); err != nil {
 		return CrossFileResult{}, err
 	}
-	p.mergeCrossFindings(in, crossCollector, crossFindingsSuppressed, moduleCollector, &result)
+	track("mergeCrossFindings", func() {
+		p.mergeCrossFindings(in, crossCollector, crossFindingsSuppressed, moduleCollector, &result)
+	})
 	return result, nil
 }
 

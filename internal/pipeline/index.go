@@ -573,13 +573,31 @@ func (p IndexPhase) Run(ctx context.Context, in IndexInput) (IndexResult, error)
 	}
 
 	caps := unionNeeds(in.ActiveRules)
+	track := func(name string, fn func()) {
+		if in.Tracker == nil || !in.Tracker.IsEnabled() {
+			fn()
+			return
+		}
+		in.Tracker.TrackVoid(name, fn)
+	}
+	trackErr := func(name string, fn func() error) error {
+		if in.Tracker == nil || !in.Tracker.IsEnabled() {
+			return fn()
+		}
+		return in.Tracker.Track(name, fn)
+	}
 
 	resolverForOracle := in.BaseResolver
 	if resolverForOracle == nil && in.PrebuiltResolver == nil {
 		// Build the base resolver up-front so runOracle has something
 		// to wrap. Returns nil when no rule needs a resolver — that's
 		// the early-out the oracle gate below also enforces.
-		built, err := p.buildBaseResolver(ctx, in, caps)
+		var built typeinfer.TypeResolver
+		err := trackErr("buildBaseResolver", func() error {
+			var berr error
+			built, berr = p.buildBaseResolver(ctx, in, caps)
+			return berr
+		})
 		if err != nil {
 			return IndexResult{}, err
 		}
@@ -590,13 +608,19 @@ func (p IndexPhase) Run(ctx context.Context, in IndexInput) (IndexResult, error)
 		resolverForOracle = p.runOracle(in, resolverForOracle, &result)
 	}
 
-	result.Resolver = p.buildTypeResolver(in, resolverForOracle, caps)
+	track("buildTypeResolver", func() {
+		result.Resolver = p.buildTypeResolver(in, resolverForOracle, caps)
+	})
 
-	if graph := p.discoverModuleGraph(in); graph != nil {
-		result.Graph = graph
-	}
+	track("discoverModuleGraph", func() {
+		if graph := p.discoverModuleGraph(in); graph != nil {
+			result.Graph = graph
+		}
+	})
 
-	p.detectAndroidProject(in, &result)
+	track("detectAndroidProject", func() {
+		p.detectAndroidProject(in, &result)
+	})
 
 	if in.BuildCodeIndex {
 		p.runCodeIndexBuild(in, &result)
