@@ -27,9 +27,89 @@ type SLOConfig struct {
 	MaxErrorsPerKLOC   *float64
 }
 
+// AnalysisConfig is the typed shape of the top-level `analysis:` block.
+// Empty Depth means "not configured" — callers fall back to their own
+// default (typically the CLI-flag default).
+type AnalysisConfig struct {
+	Depth string
+}
+
+// ParseCacheConfig is the typed shape of the top-level `parseCache:`
+// block. Zero MaxSizeMB means "not configured" — caller decides whether
+// that disables the parse cache or applies its own default.
+type ParseCacheConfig struct {
+	MaxSizeMB int
+}
+
+// LSPConfig is the typed shape of the top-level `lsp:` block. Used by
+// the LSP server to extend the JVM classpath beyond what's auto-derived
+// from Gradle. Nil/empty Classpath means "no user override".
+type LSPConfig struct {
+	Classpath []string
+}
+
+// OracleConfig is the typed shape of the top-level `oracle:` block.
+// Used by the JVM-backed Kotlin Analysis API daemon. Nil/empty
+// Classpath means "no user override".
+type OracleConfig struct {
+	Classpath []string
+}
+
 // NewConfig creates an empty Config.
 func NewConfig() *Config {
 	return &Config{data: make(map[string]interface{})}
+}
+
+// NewConfigFromData wraps the supplied map without copying. Intended
+// for tests and callers that already hold a typed-by-convention raw
+// map (e.g. fixtures). Passing nil yields an empty Config. The caller
+// must not mutate the map after handing it over.
+func NewConfigFromData(data map[string]interface{}) *Config {
+	if data == nil {
+		data = make(map[string]interface{})
+	}
+	return &Config{data: data}
+}
+
+// lookupValue walks data along path and returns the value at the leaf,
+// or (nil, false) if any segment is missing or not a map. Path lengths
+// of zero return (nil, false). This is the single primitive every
+// typed accessor on Config routes through, so the deep-map traversal
+// logic lives in one tested place.
+func lookupValue(data map[string]interface{}, path ...string) (interface{}, bool) {
+	if len(path) == 0 || data == nil {
+		return nil, false
+	}
+	cur := data
+	for i, k := range path {
+		v, ok := cur[k]
+		if !ok {
+			return nil, false
+		}
+		if i == len(path)-1 {
+			return v, true
+		}
+		next, ok := v.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		cur = next
+	}
+	return nil, false
+}
+
+// lookupMap is lookupValue with a map-typed result, returning (nil,
+// false) if the leaf is not a map[string]interface{}.
+func lookupMap(data map[string]interface{}, path ...string) (map[string]interface{}, bool) {
+	v, ok := lookupValue(data, path...)
+	if !ok {
+		return nil, false
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	return m, true
 }
 
 // LoadConfig loads a YAML config file and returns a Config.
@@ -156,18 +236,10 @@ func (c *Config) IsRuleActive(ruleSet, rule string) *bool {
 // IsRuleSetActive returns whether an entire ruleset is active.
 // Returns nil if not specified.
 func (c *Config) IsRuleSetActive(ruleSet string) *bool {
-	if c == nil || c.data == nil {
+	if c == nil {
 		return nil
 	}
-	rsData, ok := c.data[ruleSet]
-	if !ok {
-		return nil
-	}
-	rsMap, ok := rsData.(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	v, ok := rsMap["active"]
+	v, ok := lookupValue(c.data, ruleSet, "active")
 	if !ok {
 		return nil
 	}
@@ -273,71 +345,42 @@ func (c *Config) Has(ruleSet, rule, key string) bool {
 
 // getRuleConfig returns the config map for a specific rule within a ruleset.
 func (c *Config) getRuleConfig(ruleSet, rule string) map[string]interface{} {
-	rsData, ok := c.data[ruleSet]
-	if !ok {
+	if c == nil {
 		return nil
 	}
-	rsMap, ok := rsData.(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	ruleData, ok := rsMap[rule]
-	if !ok {
-		return nil
-	}
-	ruleMap, ok := ruleData.(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	return ruleMap
+	m, _ := lookupMap(c.data, ruleSet, rule)
+	return m
 }
 
 // GetTopLevelString returns a string value from a top-level config section.
 // For example, GetTopLevelString("android", "enabled", "auto") reads android.enabled.
 func (c *Config) GetTopLevelString(section, key, defaultVal string) string {
-	if c == nil || c.data == nil {
+	if c == nil {
 		return defaultVal
 	}
-	secData, ok := c.data[section]
+	v, ok := lookupValue(c.data, section, key)
 	if !ok {
 		return defaultVal
 	}
-	secMap, ok := secData.(map[string]interface{})
-	if !ok {
-		return defaultVal
+	if s, ok := v.(string); ok {
+		return s
 	}
-	v, ok := secMap[key]
-	if !ok {
-		return defaultVal
-	}
-	s, ok := v.(string)
-	if !ok {
-		// Handle bool values serialized as native YAML types
-		if b, ok := v.(bool); ok {
-			if b {
-				return "true"
-			}
-			return "false"
+	// Handle bool values serialized as native YAML types
+	if b, ok := v.(bool); ok {
+		if b {
+			return "true"
 		}
-		return defaultVal
+		return "false"
 	}
-	return s
+	return defaultVal
 }
 
 // GetTopLevelStringList returns a string slice from a top-level section.
 func (c *Config) GetTopLevelStringList(section, key string) []string {
-	if c == nil || c.data == nil {
+	if c == nil {
 		return nil
 	}
-	secData, ok := c.data[section]
-	if !ok {
-		return nil
-	}
-	secMap, ok := secData.(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	v, ok := secMap[key]
+	v, ok := lookupValue(c.data, section, key)
 	if !ok {
 		return nil
 	}
@@ -353,6 +396,34 @@ func (c *Config) ModuleTemplate() ModuleTemplateConfig {
 	}
 }
 
+// Analysis returns the typed `analysis:` block.
+func (c *Config) Analysis() AnalysisConfig {
+	return AnalysisConfig{
+		Depth: c.GetTopLevelString("analysis", "depth", ""),
+	}
+}
+
+// ParseCache returns the typed `parseCache:` block.
+func (c *Config) ParseCache() ParseCacheConfig {
+	return ParseCacheConfig{
+		MaxSizeMB: c.GetTopLevelInt("parseCache", "maxSizeMB", 0),
+	}
+}
+
+// LSP returns the typed `lsp:` block.
+func (c *Config) LSP() LSPConfig {
+	return LSPConfig{
+		Classpath: c.GetTopLevelStringList("lsp", "classpath"),
+	}
+}
+
+// Oracle returns the typed `oracle:` block.
+func (c *Config) Oracle() OracleConfig {
+	return OracleConfig{
+		Classpath: c.GetTopLevelStringList("oracle", "classpath"),
+	}
+}
+
 func (c *Config) TestSourcePaths() []string {
 	return c.GetTopLevelList("testSourcePaths")
 }
@@ -362,10 +433,10 @@ func (c *Config) TestSourcePathsOverride() []string {
 }
 
 func (c *Config) SLOs() []SLOConfig {
-	if c == nil || c.data == nil {
+	if c == nil {
 		return nil
 	}
-	raw, ok := c.data["slos"]
+	raw, ok := lookupValue(c.data, "slos")
 	if !ok {
 		return nil
 	}
@@ -410,18 +481,10 @@ func (c *Config) GetTopLevelList(key string) []string {
 // For example, GetTopLevelInt("parseCache", "maxSizeMB", 200) reads
 // parseCache.maxSizeMB.
 func (c *Config) GetTopLevelInt(section, key string, defaultVal int) int {
-	if c == nil || c.data == nil {
+	if c == nil {
 		return defaultVal
 	}
-	secData, ok := c.data[section]
-	if !ok {
-		return defaultVal
-	}
-	secMap, ok := secData.(map[string]interface{})
-	if !ok {
-		return defaultVal
-	}
-	v, ok := secMap[key]
+	v, ok := lookupValue(c.data, section, key)
 	if !ok {
 		return defaultVal
 	}

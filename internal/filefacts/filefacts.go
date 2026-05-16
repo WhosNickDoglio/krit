@@ -10,11 +10,48 @@
 package filefacts
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/kaeawc/krit/internal/scanner"
 )
+
+// slotTypeMismatch panics with the offending slot key when a cache slot
+// is reused with a different generic instantiation. The slot is a
+// programmer-controlled constant, so a mismatch is a bug at the call
+// site, not a runtime data condition. Failing loud here surfaces the
+// offending slot instead of the opaque "interface conversion" panic the
+// runtime would otherwise produce.
+func slotTypeMismatch(slot string, want, got any) {
+	panic(fmt.Sprintf("filefacts: slot %q type mismatch: want %T, got %T", slot, want, got))
+}
+
+// loadOrStoreTyped is the shared cache-miss/cache-hit body for the
+// StringFact/FileFact/NodeFact accessors. Both assertions are
+// necessary: the first guards the cache-hit fast path, the second
+// guards against a concurrent writer storing a wrong-typed value
+// under the same key+slot (the LoadOrStore returns whichever value
+// the race produced, which is not guaranteed to be the one we just
+// computed).
+func loadOrStoreTyped[T any](sm *sync.Map, key any, slot string, compute func() T) T {
+	if cached, ok := sm.Load(key); ok {
+		typed, tok := cached.(T)
+		if !tok {
+			var zero T
+			slotTypeMismatch(slot, zero, cached)
+		}
+		return typed
+	}
+	v := compute()
+	actual, _ := sm.LoadOrStore(key, v)
+	typed, tok := actual.(T)
+	if !tok {
+		var zero T
+		slotTypeMismatch(slot, zero, actual)
+	}
+	return typed
+}
 
 // Cache memoizes per-file facts for a single analysis run. The zero
 // value is unusable; obtain one with NewCache. A nil *Cache is a valid
@@ -42,13 +79,7 @@ func StringFact[T any](c *Cache, key, slot string, compute func() T) T {
 	if c == nil || key == "" {
 		return compute()
 	}
-	k := stringSlotKey{key: key, slot: slot}
-	if cached, ok := c.stringSlots.Load(k); ok {
-		return cached.(T)
-	}
-	v := compute()
-	actual, _ := c.stringSlots.LoadOrStore(k, v)
-	return actual.(T)
+	return loadOrStoreTyped(&c.stringSlots, stringSlotKey{key: key, slot: slot}, slot, compute)
 }
 
 type fileSlotKey struct {
@@ -71,13 +102,7 @@ func FileFact[T any](c *Cache, file *scanner.File, slot string, compute func() T
 	if c == nil || file == nil {
 		return compute()
 	}
-	key := fileSlotKey{file: file, slot: slot}
-	if cached, ok := c.fileSlots.Load(key); ok {
-		return cached.(T)
-	}
-	v := compute()
-	actual, _ := c.fileSlots.LoadOrStore(key, v)
-	return actual.(T)
+	return loadOrStoreTyped(&c.fileSlots, fileSlotKey{file: file, slot: slot}, slot, compute)
 }
 
 // NodeFact returns a per-(file, node) derived value, computing on
@@ -87,13 +112,7 @@ func NodeFact[T any](c *Cache, file *scanner.File, idx uint32, slot string, comp
 	if c == nil || file == nil || idx == 0 {
 		return compute()
 	}
-	key := nodeSlotKey{file: file, idx: idx, slot: slot}
-	if cached, ok := c.nodeSlots.Load(key); ok {
-		return cached.(T)
-	}
-	v := compute()
-	actual, _ := c.nodeSlots.LoadOrStore(key, v)
-	return actual.(T)
+	return loadOrStoreTyped(&c.nodeSlots, nodeSlotKey{file: file, idx: idx, slot: slot}, slot, compute)
 }
 
 // NewCache returns a fresh, empty Cache. Use one Cache per analysis
