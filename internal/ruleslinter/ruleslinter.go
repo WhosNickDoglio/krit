@@ -92,6 +92,20 @@ var adHocCacheInfraFiles = map[string]bool{
 // grandfatheredAdHocCaches; legitimate infrastructure files are listed
 // in adHocCacheInfraFiles. Test files are skipped.
 func AnalyzeAdHocCaches(dir string) ([]Violation, error) {
+	return walkRulesPackageDir(dir, func(name string) bool {
+		return adHocCacheInfraFiles[name]
+	}, scanAdHocCaches)
+}
+
+// walkRulesPackageDir parses every non-test .go file in dir (skipping
+// directories, test files, and any filename for which extraSkip returns
+// true) and concatenates the violations returned by scan. Results are
+// sorted by (filename, offset). extraSkip may be nil.
+func walkRulesPackageDir(
+	dir string,
+	extraSkip func(basename string) bool,
+	scan func(fset *token.FileSet, file *ast.File, basename string) []Violation,
+) ([]Violation, error) {
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -105,7 +119,7 @@ func AnalyzeAdHocCaches(dir string) ([]Violation, error) {
 		if strings.HasSuffix(e.Name(), "_test.go") {
 			continue
 		}
-		if adHocCacheInfraFiles[e.Name()] {
+		if extraSkip != nil && extraSkip(e.Name()) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
@@ -113,7 +127,7 @@ func AnalyzeAdHocCaches(dir string) ([]Violation, error) {
 		if err != nil {
 			return nil, fmt.Errorf("ruleslinter: parse %s: %w", path, err)
 		}
-		violations = append(violations, scanAdHocCaches(fset, f, e.Name())...)
+		violations = append(violations, scan(fset, f, e.Name())...)
 	}
 	sort.Slice(violations, func(i, j int) bool {
 		if violations[i].Position.Filename != violations[j].Position.Filename {
@@ -885,33 +899,9 @@ func isMergeCollectorsCall(call *ast.CallExpr) bool {
 //
 // Test files are skipped.
 func AnalyzeOptInReason(dir string) ([]Violation, error) {
-	fset := token.NewFileSet()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("ruleslinter: read dir: %w", err)
-	}
-	var violations []Violation
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
-			continue
-		}
-		if strings.HasSuffix(e.Name(), "_test.go") {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
-		if err != nil {
-			return nil, fmt.Errorf("ruleslinter: parse %s: %w", path, err)
-		}
-		violations = append(violations, scanOptInReason(fset, f)...)
-	}
-	sort.Slice(violations, func(i, j int) bool {
-		if violations[i].Position.Filename != violations[j].Position.Filename {
-			return violations[i].Position.Filename < violations[j].Position.Filename
-		}
-		return violations[i].Position.Offset < violations[j].Position.Offset
+	return walkRulesPackageDir(dir, nil, func(fset *token.FileSet, file *ast.File, _ string) []Violation {
+		return scanOptInReason(fset, file)
 	})
-	return violations, nil
 }
 
 func scanOptInReason(fset *token.FileSet, file *ast.File) []Violation {
@@ -1025,6 +1015,173 @@ func optInReasonName(expr ast.Expr) string {
 		return v.Name
 	}
 	return ""
+}
+
+// AnalyzeDefensiveContextGuards scans every .go file in dir for the
+// defensive `if ctx.File == nil { return }` / `if ctx.Idx == 0 { return }`
+// boilerplate that historically appeared at the top of rule callbacks.
+//
+// The dispatcher in internal/rules/dispatcher.go guarantees that ctx.File
+// is non-nil for every rule callback invocation, and that ctx.Idx points
+// at the matched flat-tree index (never 0 for ScopePerFileNode rules whose
+// NodeTypes filter out the source_file root). The guards are therefore
+// theater that costs review attention and obscures real preconditions.
+//
+// A finding here means: a function with a *api.Context parameter contains
+// an `if` whose condition mentions ctx.File == nil or ctx.Idx == 0 and
+// whose body is a bare `return` (no value). Helper functions that return
+// a value (false / 0 / "") are intentionally not flagged because they
+// may be invoked from non-dispatcher paths (tests, other helpers) where
+// the dispatcher contract does not apply.
+//
+// Test files are skipped so this file's tests, which construct example
+// rule source containing the pattern as a string fixture, do not trip
+// the gate.
+func AnalyzeDefensiveContextGuards(dir string) ([]Violation, error) {
+	return walkRulesPackageDir(dir, func(name string) bool {
+		// dispatcher.go legitimately reads ctx.File / ctx.Idx to wire the
+		// context up; skip it (and any sibling dispatcher_*.go) so the
+		// gate only inspects rule callbacks, not the dispatcher itself.
+		return name == "dispatcher.go" || strings.HasPrefix(name, "dispatcher_")
+	}, func(fset *token.FileSet, file *ast.File, _ string) []Violation {
+		return scanDefensiveContextGuards(fset, file)
+	})
+}
+
+// scanDefensiveContextGuards inspects every function in file whose
+// signature carries a *api.Context parameter and flags `if` statements
+// of the form `if ctx.File == nil { return }` (and variants involving
+// ctx.Idx == 0). Functions that return values are skipped — they are
+// helpers, not rule callbacks, and may be invoked from non-dispatcher
+// paths.
+//
+// Limitation: init-form guards like `if x := ctx.File; x == nil { return }`
+// are not detected (the analysis would have to track the assigned name
+// through the body). New code should not introduce that shape; the bare
+// `if ctx.File == nil { return }` form is what previously accumulated.
+func scanDefensiveContextGuards(fset *token.FileSet, file *ast.File) []Violation {
+	var out []Violation
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		ctxName := ctxParamName(fn.Type)
+		if ctxName == "" {
+			continue
+		}
+		// Only functions that have no return values: rule callbacks return
+		// nothing. Helpers that return false/0/"" remain in charge of their
+		// own nil-safety.
+		if fn.Type.Results != nil && len(fn.Type.Results.List) > 0 {
+			continue
+		}
+		for _, stmt := range fn.Body.List {
+			ifStmt, ok := stmt.(*ast.IfStmt)
+			if !ok || ifStmt.Init != nil {
+				continue
+			}
+			if !ifBodyIsBareReturn(ifStmt.Body) {
+				continue
+			}
+			if !condReferencesContextGuard(ifStmt.Cond, ctxName) {
+				continue
+			}
+			advice := "Delete the guard"
+			if _, compound := ifStmt.Cond.(*ast.BinaryExpr); compound && condIsLogicalOr(ifStmt.Cond) {
+				advice = "Drop the dispatcher-guaranteed half of the `||`, or split the remaining check into a separate `if`"
+			}
+			out = append(out, Violation{
+				RuleID:   fn.Name.Name,
+				Position: fset.Position(ifStmt.Pos()),
+				Message:  "defensive `if " + ctxName + ".File == nil` / `" + ctxName + ".Idx == 0` guard in rule callback; the dispatcher guarantees both. " + advice + " — see internal/rules/dispatcher.go.",
+			})
+		}
+	}
+	return out
+}
+
+// condIsLogicalOr reports whether the top-level operator of cond is `||`.
+// Used to tailor the violation message when the guard is compounded with
+// a real precondition.
+func condIsLogicalOr(cond ast.Expr) bool {
+	bin, ok := cond.(*ast.BinaryExpr)
+	return ok && bin.Op == token.LOR
+}
+
+// ifBodyIsBareReturn reports whether body is `{ return }` — a single bare
+// `return` statement with no value. Guards with `return false` belong to
+// helper functions and stay.
+func ifBodyIsBareReturn(body *ast.BlockStmt) bool {
+	if body == nil || len(body.List) != 1 {
+		return false
+	}
+	ret, ok := body.List[0].(*ast.ReturnStmt)
+	if !ok {
+		return false
+	}
+	return len(ret.Results) == 0
+}
+
+// condReferencesContextGuard reports whether the boolean expression cond
+// mentions `<ctx>.File == nil` or `<ctx>.Idx == 0` anywhere in its tree
+// (including the LHS of `||` chains).
+func condReferencesContextGuard(cond ast.Expr, ctxName string) bool {
+	found := false
+	ast.Inspect(cond, func(n ast.Node) bool {
+		bin, ok := n.(*ast.BinaryExpr)
+		if !ok || bin.Op != token.EQL {
+			return true
+		}
+		if isContextFieldNilCompare(bin.X, bin.Y, ctxName, "File") ||
+			isContextFieldNilCompare(bin.Y, bin.X, ctxName, "File") {
+			found = true
+			return false
+		}
+		if isContextFieldZeroCompare(bin.X, bin.Y, ctxName, "Idx") ||
+			isContextFieldZeroCompare(bin.Y, bin.X, ctxName, "Idx") {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// isContextFieldNilCompare reports whether lhs is `<ctxName>.<field>` and
+// rhs is the identifier `nil`.
+func isContextFieldNilCompare(lhs, rhs ast.Expr, ctxName, field string) bool {
+	sel, ok := lhs.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != field {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	if !ok || id.Name != ctxName {
+		return false
+	}
+	rid, ok := rhs.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	return rid.Name == "nil"
+}
+
+// isContextFieldZeroCompare reports whether lhs is `<ctxName>.<field>` and
+// rhs is the literal `0`.
+func isContextFieldZeroCompare(lhs, rhs ast.Expr, ctxName, field string) bool {
+	sel, ok := lhs.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != field {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	if !ok || id.Name != ctxName {
+		return false
+	}
+	lit, ok := rhs.(*ast.BasicLit)
+	if !ok || lit.Kind != token.INT {
+		return false
+	}
+	return lit.Value == "0"
 }
 
 // guessReceiverType looks at sel.X and returns the type name if it
