@@ -140,6 +140,34 @@ func dispatchDaemonShortCircuits(f *scanFlags, paths []string, res daemon.Analyz
 	return false, 0
 }
 
+// formatNeedsLocalColumnar reports whether the configured output
+// format is non-JSON-shaped and must be rendered locally from the
+// daemon-shipped FindingColumns. AnalyzeProjectResult.Findings is a
+// json.RawMessage on the wire, so checkstyle XML / plain text bytes
+// would corrupt the envelope JSON if formatted daemon-side.
+func formatNeedsLocalColumnar(format string) bool {
+	return format == "checkstyle" || format == "plain"
+}
+
+// writeDaemonColumnarFindings decodes the daemon-shipped FindingColumns
+// segment and runs the columnar formatter for non-JSON-shaped outputs.
+// Called when formatNeedsLocalColumnar(format) is true.
+func writeDaemonColumnarFindings(w io.Writer, format string, rawColumns json.RawMessage) error {
+	cols, err := decodeDaemonColumns(rawColumns)
+	if err != nil {
+		return fmt.Errorf("decode columns: %w", err)
+	}
+	switch format {
+	case "plain":
+		output.FormatPlainColumns(w, cols)
+	case "checkstyle":
+		output.FormatCheckstyleColumns(w, cols)
+	default:
+		return fmt.Errorf("unsupported columnar format: %s", format)
+	}
+	return nil
+}
+
 // writeDaemonFindings handles the common path: stream the daemon's
 // findings JSON to the configured output writer, surface any
 // profile warnings, render the dispatch-profile table when armed,
@@ -150,7 +178,14 @@ func writeDaemonFindings(f *scanFlags, res daemon.AnalyzeProjectResult, start ti
 		fmt.Fprintf(os.Stderr, "error: %v\n", openErr)
 		return 2
 	}
-	if _, err := w.Write(res.Findings); err != nil {
+	effectiveFormat := resolveEffectiveFormat(f)
+	if formatNeedsLocalColumnar(effectiveFormat) {
+		if err := writeDaemonColumnarFindings(w, effectiveFormat, res.Columns); err != nil {
+			_ = closer()
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 2
+		}
+	} else if _, err := w.Write(res.Findings); err != nil {
 		_ = closer()
 		fmt.Fprintf(os.Stderr, "error: write findings: %v\n", err)
 		return 2
@@ -552,10 +587,15 @@ func daemonCompatibleFlags(f *scanFlags) bool {
 // propagated; anything outside that set should have been filtered
 // upstream.
 func buildDaemonAnalyzeArgs(f *scanFlags, paths []string) daemon.AnalyzeProjectArgs {
-	format := *f.Format
-	if *f.Report != "" {
-		format = *f.Report
-	}
+	// Use resolveEffectiveFormat so the wire-side and the local-side
+	// (writeDaemonFindings) agree on what the CLI is going to render:
+	// `-f json` to a char-device stdout (e.g. /dev/null in CI's
+	// run_lint_test) auto-promotes to "plain", and if the wire decision
+	// here is taken on raw *f.Format the daemon ships no columns while
+	// writeDaemonFindings tries to render them. See formatNeedsLocalColumnar
+	// below — the includeColumns / wireFormat rewrite for plain / checkstyle
+	// only fires when both sides see the promoted "plain".
+	format := resolveEffectiveFormat(f)
 	// --sample-rule asks for JSON findings post-processed on the CLI
 	// side. Force the daemon to emit JSON regardless of the user's
 	// --format choice so the writer can decode the envelope. The
@@ -597,11 +637,23 @@ func buildDaemonAnalyzeArgs(f *scanFlags, paths []string) daemon.AnalyzeProjectA
 	// directly and discards the findings JSON, but the daemon still
 	// streams it. --baseline-audit / --delta tolerate any format on
 	// the daemon side because the bytes are discarded the same way.
+	//
+	// Non-JSON-shaped formats (checkstyle XML / plain text) must also
+	// ride the columns wire: AnalyzeProjectResult.Findings is a
+	// json.RawMessage, so daemon-side formatted XML / text would
+	// corrupt the envelope JSON. Force the daemon to emit JSON for
+	// findings (cheap, columns are the source of truth) and run the
+	// columnar formatter locally in writeDaemonFindings.
+	wireFormat := format
 	includeColumns := *f.RuleAudit || *f.BaselineAudit || *f.Delta != "" ||
 		*f.Fix || *f.FixBinary || *f.RemoveDeadCode
+	if formatNeedsLocalColumnar(format) {
+		includeColumns = true
+		wireFormat = "json"
+	}
 	return daemon.AnalyzeProjectArgs{
 		Paths:            paths,
-		Format:           format,
+		Format:           wireFormat,
 		BaselinePath:     baselinePath,
 		DiffRef:          *f.Diff,
 		MinConfidence:    *f.MinConfidence,
